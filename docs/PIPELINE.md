@@ -48,6 +48,24 @@ Bước 6 không phụ thuộc bước 4-5: có thể chạy ngay sau bước 3 
   | `json:<đường dẫn>` | file JSON |
   | `fail` | thất bại, xem stderr |
 
+- **Mã lỗi** (các bước gọi Gemini: 5, 8, 9): mỗi lỗi là một dòng stderr dạng
+  `[<script>] <MÃ>: <nội dung>`, định nghĩa trong `post_process/gemini_errors.py`. Lấy mã trong n8n:
+  `{{ ($json.stderr.match(/\] (E_[A-Z_]+):/) || [])[1] }}`
+
+  | Mã | Ý nghĩa | Nên làm |
+  |---|---|---|
+  | `E_QUOTA_DAILY` | hết hạn mức request/ngày của model; báo **ngay**, không thử lại. Cuối dòng có `retry_after=<giây>s` | chờ theo `retry_after` hoặc nâng tier, rồi chạy lại |
+  | `E_RATE_LIMIT` | vẫn bị giới hạn theo phút sau khi đã thử lại | chạy lại sau ít phút |
+  | `E_AUTH` | thiếu/sai API key, không có quyền (HTTP 401/403) | kiểm tra `GEMINI_API_KEY` |
+  | `E_BAD_REQUEST` | request bị từ chối (HTTP 400/404: sai tên model, dữ liệu sai) | xem nội dung lỗi |
+  | `E_SERVER` | lỗi phía Google (HTTP 5xx) sau khi thử lại | chạy lại sau |
+  | `E_NETWORK` | không kết nối được Gemini sau khi thử lại | kiểm tra mạng |
+  | `E_NO_OUTPUT` | Gemini trả lời nhưng thiếu nội dung (không có âm thanh, câu trả lời rỗng) | chạy lại |
+  | `E_INVALID_ANSWER` | câu trả lời vẫn sai quy tắc sau mọi lần sửa | chạy lại / xem `gem_*response.json` |
+  | `E_TOO_LONG` | giọng đọc dài hơn video kể cả khi tăng tốc tối đa (bước 9) | chạy lại bước 8 cho video đó |
+  | `E_INPUT` | thiếu/sai file hoặc tham số đầu vào | sửa lệnh |
+  | `E_UNEXPECTED` | lỗi khác (bug) | báo lại |
+
 - Trong n8n, đường dẫn của bước sau được tính từ stdout của node ngay trước (`$json.stdout`).
   Khi cần stdout của một node xa hơn, dùng `$('Tên node').item.json.stdout`.
 - Sửa file trong `post_process/` thì phải build lại image: `docker compose up -d --build n8n`.
@@ -295,7 +313,10 @@ của câu. Script cắt khoảng lặng hai đầu mỗi câu, ghép lại (0,1
 
 Khớp độ dài: giọng đọc dài hơn video (trừ 0,1s cuối) thì tăng tốc giữ nguyên cao độ (`atempo`), tối đa `--max-speedup`
 (1,15x); vẫn dài quá thì video đó `fail`, stderr gợi ý chạy lại `gemini_voiceover --video N --rate <tốc độ đo được>`.
-Request được giãn cách theo `GEMINI_TTS_RPM`; gặp 429 thì chờ đúng thời gian server yêu cầu.
+Request được giãn cách theo `GEMINI_TTS_RPM`; gặp 429 theo phút thì chờ đúng thời gian server yêu cầu.
+**Hạn mức theo ngày** (Tier 1: 100 request/ngày cho `gemini-3.8-flash-tts`; mỗi câu thoại là 1 request, khoảng 6-8
+request mỗi video) khi hết thì dừng ngay: báo `E_QUOTA_DAILY` kèm `retry_after`, giữ các video đã xong trong `tts.json`,
+và dòng cuối stderr ghi các video cần chạy lại (`--video ...`).
 
 `tts.json`:
 ```

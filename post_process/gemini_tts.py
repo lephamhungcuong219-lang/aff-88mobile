@@ -25,12 +25,16 @@ Files:
 
 Environment: GEMINI_API_KEY (required), GEMINI_TTS_MODEL (optional, default below),
 GEMINI_TTS_RPM (optional, requests per minute allowed for your tier, default 10).
-Requests are spaced to stay under that limit, and a 429 waits for the time the
-server asks ("retry in Ns") before retrying. A video of 7 lines takes ~45 s at 10 RPM.
+Requests are spaced to stay under that limit, and a per-minute 429 waits for the time
+the server asks ("retry in 41s") before retrying. A video of 7 lines takes ~45 s at 10 RPM.
+The DAILY limit (e.g. 100 requests per day on Tier 1) is not retried: the run stops at
+once, keeps the videos already done in tts.json and reports E_QUOTA_DAILY.
 
 Stdout: 'json:<absolute tts.json>' on success, or exactly 'fail' (if any video failed;
         the videos that succeeded are still written).
-Stderr: progress and the reason for a failure (human-readable).
+Stderr: progress; every failure is one line "[gemini_tts] <CODE>: <message>" with the
+        codes of gemini_errors.py (E_QUOTA_DAILY, E_RATE_LIMIT, E_AUTH, E_TOO_LONG, ...),
+        then a summary line with the videos to re-run (--video ...).
 Exit code: 0 for success, 1 for failure.
 """
 
@@ -53,6 +57,15 @@ from urllib.error import HTTPError, URLError
 
 import numpy as np
 
+try:  # python -m post_process.gemini_tts
+    from post_process.gemini_errors import (E_AUTH, E_INPUT, E_NETWORK, E_NO_OUTPUT, E_QUOTA_DAILY,
+                                            E_TOO_LONG, E_UNEXPECTED, GeminiError, format_error,
+                                            http_error, is_daily_quota, parse_retry_after)
+except ImportError:  # python post_process/gemini_tts.py
+    from gemini_errors import (E_AUTH, E_INPUT, E_NETWORK, E_NO_OUTPUT, E_QUOTA_DAILY, E_TOO_LONG,
+                               E_UNEXPECTED, GeminiError, format_error, http_error, is_daily_quota,
+                               parse_retry_after)
+
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 DEFAULT_MODEL = "gemini-3.8-flash-tts"
 DEFAULT_VOICE = "Puck"
@@ -66,14 +79,18 @@ DEFAULT_RPM = 10          # requests per minute allowed for the TTS model (Tier 
 SILENCE_DB = -42.0        # trim threshold around each line
 KEEP_EDGE_S = 0.04        # silence kept at both ends of a trimmed line
 END_MARGIN_S = 0.10       # the voice must end this long before the video ends
+MAX_RETRY_WAIT_S = 120    # a 429 asking to wait longer than this is not retried
 
-
-class TTSError(Exception):
-    """A failure with a human-readable reason."""
+TTSError = GeminiError
+QUOTA_HIT = threading.Event()  # set as soon as the daily limit is reached: stop every request
 
 
 def log(message: str) -> None:
     print(f"[gemini_tts] {message}", file=sys.stderr)
+
+
+def log_error(error: Exception) -> None:
+    print(format_error("gemini_tts", error), file=sys.stderr)
 
 
 def syllables(text: str) -> int:
@@ -100,9 +117,9 @@ LIMITER = RateLimiter(DEFAULT_RPM)
 
 
 def retry_delay(detail: str, attempt: int) -> float:
-    """Seconds to wait before retrying: the server's 'retry in Ns' hint, else exponential."""
-    match = re.search(r"retry in (\d+(?:\.\d+)?)\s*s", detail, re.IGNORECASE)
-    return float(match.group(1)) + 1.0 if match else 4.0 * 2 ** (attempt - 1)
+    """Seconds to wait before retrying: the server's 'retry in ...' hint, else exponential."""
+    hint = parse_retry_after(detail)
+    return hint + 1.0 if hint is not None else 4.0 * 2 ** (attempt - 1)
 
 
 def synthesize(text: str, style: str, voice: str, model: str, api_key: str) -> np.ndarray:
@@ -119,20 +136,28 @@ def synthesize(text: str, style: str, voice: str, model: str, api_key: str) -> n
     request = urllib.request.Request(API_URL, data=json.dumps(body).encode("utf-8"), method="POST",
                                      headers={"Content-Type": "application/json", "x-goog-api-key": api_key})
     for attempt in range(1, HTTP_ATTEMPTS + 1):
+        if QUOTA_HIT.is_set():
+            raise TTSError("Gemini TTS daily limit reached earlier in this run", E_QUOTA_DAILY)
         LIMITER.wait()
+        if QUOTA_HIT.is_set():  # reached by another request while this one waited its turn
+            raise TTSError("Gemini TTS daily limit reached earlier in this run", E_QUOTA_DAILY)
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_S) as response:
                 data = json.loads(response.read().decode("utf-8"))
             break
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1500]
-            if not (exc.code == 429 or exc.code >= 500) or attempt == HTTP_ATTEMPTS:
-                raise TTSError(f"Gemini TTS HTTP {exc.code}: {detail}") from exc
+            if exc.code == 429 and is_daily_quota(detail):
+                QUOTA_HIT.set()  # no point retrying today: fail now, and stop the other requests
+                raise http_error(exc.code, detail, "Gemini TTS") from exc
+            retryable = exc.code == 429 or exc.code >= 500
             delay = retry_delay(detail, attempt)
+            if not retryable or attempt == HTTP_ATTEMPTS or delay > MAX_RETRY_WAIT_S:
+                raise http_error(exc.code, detail, "Gemini TTS") from exc
             log(f"HTTP {exc.code}, retrying in {delay:.0f}s ({attempt}/{HTTP_ATTEMPTS})")
         except (URLError, TimeoutError, OSError) as exc:
             if attempt == HTTP_ATTEMPTS:
-                raise TTSError(f"Could not reach Gemini TTS: {exc}") from exc
+                raise TTSError(f"Could not reach Gemini TTS: {exc}", E_NETWORK) from exc
             delay = retry_delay("", attempt)
         time.sleep(delay)
 
@@ -142,7 +167,7 @@ def synthesize(text: str, style: str, voice: str, model: str, api_key: str) -> n
             if isinstance(part, dict) and part.get("data"):
                 audio = part["data"]
     if not audio:
-        raise TTSError(f"Gemini TTS returned no audio for: {text[:80]!r}")
+        raise TTSError(f"Gemini TTS returned no audio for: {text[:80]!r}", E_NO_OUTPUT)
     return decode_wav(base64.b64decode(audio))
 
 
@@ -151,7 +176,8 @@ def decode_wav(raw: bytes) -> np.ndarray:
     if raw[:4] == b"RIFF":
         with wave.open(io.BytesIO(raw)) as wav:
             if wav.getsampwidth() != 2 or wav.getframerate() != SAMPLE_RATE:
-                raise TTSError(f"Unexpected TTS audio format: {wav.getsampwidth() * 8} bit, {wav.getframerate()} Hz")
+                raise TTSError(f"Unexpected TTS audio format: {wav.getsampwidth() * 8} bit, "
+                               f"{wav.getframerate()} Hz", E_NO_OUTPUT)
             samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
             if wav.getnchannels() > 1:
                 samples = samples.reshape(-1, wav.getnchannels()).mean(axis=1).astype("<i2")
@@ -192,7 +218,7 @@ def speed_up(samples: np.ndarray, factor: float) -> np.ndarray:
                                  "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", str(dst)],
                                 capture_output=True, text=True, errors="replace", check=False)
         if result.returncode != 0:
-            raise TTSError(f"ffmpeg atempo failed: {result.stderr.strip()}")
+            raise TTSError(f"ffmpeg atempo failed: {result.stderr.strip()}", E_UNEXPECTED)
         return decode_wav(dst.read_bytes())
 
 
@@ -234,7 +260,7 @@ def render_video(video: dict, out_dir: Path, voice: str, model: str, api_key: st
             raise TTSError(
                 f"Video {index}: voice lasts {natural:.2f}s for a {duration:.2f}s video; needs {speed:.2f}x "
                 f"(max {max_speedup}x). Rewrite it shorter: gemini_voiceover.py --video {index} "
-                f"--rate {measured_rate:.2f}")
+                f"--rate {measured_rate:.2f}", E_TOO_LONG)
         track = speed_up(track, speed)
         for t in timings:
             t["start"] /= speed
@@ -303,7 +329,7 @@ def main() -> int:
 
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not api_key or api_key == KEY_PLACEHOLDER:
-            raise TTSError("GEMINI_API_KEY is not set (fill it in .env, then recreate the container)")
+            raise TTSError("GEMINI_API_KEY is not set (fill it in .env, then recreate the container)", E_AUTH)
 
         out_dir.mkdir(parents=True, exist_ok=True)
         results = {}
@@ -313,15 +339,20 @@ def main() -> int:
             except (OSError, json.JSONDecodeError, KeyError, TypeError):
                 results = {}
 
-        failures = []
-        for video in videos:
+        failed, skipped = [], []
+        for position, video in enumerate(videos):
+            index = video["video_index"]
             try:
-                results[video["video_index"]] = render_video(video, out_dir, args.voice, model, api_key,
-                                                             args.gap, args.lead, args.max_speedup)
+                results[index] = render_video(video, out_dir, args.voice, model, api_key,
+                                              args.gap, args.lead, args.max_speedup)
             except TTSError as exc:
-                failures.append(str(exc))
-                log(str(exc))
-                results.pop(video["video_index"], None)
+                log_error(exc)  # one "[gemini_tts] E_...: ..." line per failed video
+                failed.append(index)
+                results.pop(index, None)
+                if exc.code == E_QUOTA_DAILY:
+                    # Every further request would fail too: stop now.
+                    skipped = [v["video_index"] for v in videos[position + 1:]]
+                    break
 
         tmp = tts_file.with_name(tts_file.name + ".tmp")
         tmp.write_text(json.dumps({
@@ -329,14 +360,17 @@ def main() -> int:
             "audio_dir": str(out_dir), "videos": [results[k] for k in sorted(results)],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(tts_file)
-        if failures:
-            raise TTSError(f"{len(failures)} video(s) failed; the others are in {tts_file.name}")
+        if failed:
+            log(f"Failed videos: {failed}; not attempted: {skipped}; done: {sorted(results)} "
+                f"(in {tts_file.name}). Re-run with --video {' '.join(map(str, failed + skipped))}")
+            print("fail")
+            return 1
     except TTSError as exc:
-        log(str(exc))
+        log_error(exc)
         print("fail")
         return 1
     except Exception as exc:  # noqa: BLE001 - always answer json/fail
-        log(f"Unexpected error: {exc!r}")
+        log_error(GeminiError(f"{exc!r}", E_UNEXPECTED))
         print("fail")
         return 1
 

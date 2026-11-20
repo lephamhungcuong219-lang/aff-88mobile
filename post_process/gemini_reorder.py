@@ -39,7 +39,8 @@ size and prompt).
 
 Stdout: 'json:<absolute output_json>' on success ('json:<request.json>' with
         --dry-run), or exactly 'fail'.
-Stderr: progress and the reason for a failure (human-readable).
+Stderr: progress; a failure is one line "[gemini_reorder] <CODE>: <message>" with the codes
+        of gemini_errors.py (E_QUOTA_DAILY is reported at once, without retrying).
 Exit code: 0 for success, 1 for failure.
 """
 
@@ -54,6 +55,14 @@ import urllib.request
 from itertools import combinations
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+
+try:  # python -m post_process.gemini_reorder
+    from post_process.gemini_errors import (E_AUTH, E_INVALID_ANSWER, E_NETWORK, E_NO_OUTPUT,
+                                            E_UNEXPECTED, GeminiError, format_error, http_error,
+                                            is_daily_quota, parse_retry_after)
+except ImportError:  # python post_process/gemini_reorder.py
+    from gemini_errors import (E_AUTH, E_INVALID_ANSWER, E_NETWORK, E_NO_OUTPUT, E_UNEXPECTED,
+                               GeminiError, format_error, http_error, is_daily_quota, parse_retry_after)
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -168,12 +177,16 @@ RESPONSE_SCHEMA = {
 }
 
 
-class ReorderError(Exception):
-    """A failure with a human-readable reason."""
+ReorderError = GeminiError  # message + error code (see gemini_errors.py)
+MAX_RETRY_WAIT_S = 120      # a 429 asking to wait longer than this is not retried
 
 
 def log(message: str) -> None:
     print(f"[gemini_reorder] {message}", file=sys.stderr)
+
+
+def log_error(error: Exception, script: str = "gemini_reorder") -> None:
+    print(format_error(script, error), file=sys.stderr)
 
 
 def min_videos(scenes: list[dict]) -> int:
@@ -274,40 +287,47 @@ def call_gemini(body: dict, model: str, api_key: str) -> dict:
         method="POST",
     )
     for attempt in range(1, HTTP_ATTEMPTS + 1):
+        delay = 5 * 2 ** (attempt - 1)
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_S) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:2000]
+            if exc.code == 429 and is_daily_quota(detail):
+                raise http_error(exc.code, detail, "Gemini") from exc  # E_QUOTA_DAILY: no retry
+            hint = parse_retry_after(detail)
+            delay = hint + 1 if hint is not None else delay
             retryable = exc.code == 429 or exc.code >= 500
-            if not retryable or attempt == HTTP_ATTEMPTS:
-                raise ReorderError(f"Gemini HTTP {exc.code}: {detail}") from exc
-            log(f"Gemini HTTP {exc.code}, retrying ({attempt}/{HTTP_ATTEMPTS})")
+            if not retryable or attempt == HTTP_ATTEMPTS or delay > MAX_RETRY_WAIT_S:
+                raise http_error(exc.code, detail, "Gemini") from exc
+            log(f"Gemini HTTP {exc.code}, retrying in {delay:.0f}s ({attempt}/{HTTP_ATTEMPTS})")
         except (URLError, TimeoutError, OSError) as exc:
             if attempt == HTTP_ATTEMPTS:
-                raise ReorderError(f"Could not reach Gemini: {exc}") from exc
+                raise ReorderError(f"Could not reach Gemini: {exc}", E_NETWORK) from exc
             log(f"Network error ({exc}), retrying ({attempt}/{HTTP_ATTEMPTS})")
-        time.sleep(5 * 2 ** (attempt - 1))
-    raise ReorderError("unreachable")
+        time.sleep(delay)
+    raise ReorderError("unreachable", E_UNEXPECTED)
 
 
 def extract_answer(response: dict) -> tuple[dict, dict]:
     """Return (parsed JSON answer, the model's content to send back on a retry)."""
     candidates = response.get("candidates") or []
     if not candidates:
-        raise ReorderError(f"Gemini returned no candidates (promptFeedback: {response.get('promptFeedback')})")
+        raise ReorderError(f"Gemini returned no candidates (promptFeedback: {response.get('promptFeedback')})",
+                           E_NO_OUTPUT)
     candidate = candidates[0]
     content = candidate.get("content") or {}
     parts = content.get("parts") or []
     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not text.strip():
-        raise ReorderError(f"Empty answer (finishReason: {candidate.get('finishReason')})")
+        raise ReorderError(f"Empty answer (finishReason: {candidate.get('finishReason')})", E_NO_OUTPUT)
     try:
         answer = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ReorderError(f"Answer is not valid JSON: {exc}; text starts with: {text[:300]!r}") from exc
+        raise ReorderError(f"Answer is not valid JSON: {exc}; text starts with: {text[:300]!r}",
+                           E_NO_OUTPUT) from exc
     if not isinstance(answer, dict):
-        raise ReorderError("Answer JSON is not an object")
+        raise ReorderError("Answer JSON is not an object", E_NO_OUTPUT)
     return answer, {"role": "model", "parts": parts}
 
 
@@ -463,7 +483,7 @@ def plan_videos(body: dict, scenes: list[dict], model: str, api_key: str, respon
         fix = FIX_PROMPT.format(problems="\n".join(f"- {p}" for p in problems), **rule_values(scenes))
         record({**entry, "problems": problems, "fix_prompt": fix})
         body["contents"] = body["contents"][:1] + [model_turn, {"role": "user", "parts": [{"text": fix}]}]
-    raise ReorderError(f"No valid plan after {ANSWER_ATTEMPTS} attempts: {'; '.join(problems)}")
+    raise ReorderError(f"No valid plan after {ANSWER_ATTEMPTS} attempts: {'; '.join(problems)}", E_INVALID_ANSWER)
 
 
 def main() -> int:
@@ -495,7 +515,7 @@ def main() -> int:
 
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not api_key or api_key == KEY_PLACEHOLDER:
-            raise ReorderError("GEMINI_API_KEY is not set (fill it in .env, then recreate the container)")
+            raise ReorderError("GEMINI_API_KEY is not set (fill it in .env, then recreate the container)", E_AUTH)
 
         # Drop results of a previous run so the three files always belong together.
         output.unlink(missing_ok=True)
@@ -506,11 +526,11 @@ def main() -> int:
         log(", ".join(f"video {v['video_index']}: {v['total_duration']:.1f}s" for v in result["videos"]))
         write_json(output, result)
     except ReorderError as exc:
-        log(str(exc))
+        log_error(exc)
         print("fail")
         return 1
     except Exception as exc:  # noqa: BLE001 - always answer json/fail
-        log(f"Unexpected error: {exc!r}")
+        log_error(GeminiError(f"{exc!r}", E_UNEXPECTED))
         print("fail")
         return 1
 

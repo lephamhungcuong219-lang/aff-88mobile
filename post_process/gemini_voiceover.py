@@ -34,7 +34,8 @@ Files (next to reorder.json unless --output):
 Environment: GEMINI_API_KEY (required), GEMINI_MODEL (optional).
 
 Stdout: 'json:<absolute voiceover.json>' on success, or exactly 'fail'.
-Stderr: progress and the reason for a failure (human-readable).
+Stderr: progress; a failure is one line "[gemini_voiceover] <CODE>: <message>" with the codes
+        of gemini_errors.py (E_QUOTA_DAILY is reported at once, without retrying).
 Exit code: 0 for success, 1 for failure.
 """
 
@@ -47,9 +48,11 @@ import sys
 from pathlib import Path
 
 try:  # python -m post_process.gemini_voiceover
+    from post_process.gemini_errors import E_AUTH, E_INVALID_ANSWER, E_UNEXPECTED, GeminiError, format_error
     from post_process.gemini_reorder import (DEFAULT_MODEL, KEY_PLACEHOLDER, MAX_INLINE_BYTES,
                                              ReorderError, call_gemini, extract_answer, write_json)
 except ImportError:  # python post_process/gemini_voiceover.py
+    from gemini_errors import E_AUTH, E_INVALID_ANSWER, E_UNEXPECTED, GeminiError, format_error
     from gemini_reorder import (DEFAULT_MODEL, KEY_PLACEHOLDER, MAX_INLINE_BYTES,
                                 ReorderError, call_gemini, extract_answer, write_json)
 
@@ -258,7 +261,8 @@ def write_voiceover(model: str, video: dict, proxy: Path, rate: float, limits: d
         fix = FIX_PROMPT.format(problems="\n".join(f"- {p}" for p in problems), **limits)
         attempts_log.append({**entry, "problems": problems, "fix_prompt": fix})
         body["contents"] = body["contents"][:1] + [model_turn, {"role": "user", "parts": [{"text": fix}]}]
-    raise ReorderError(f"Video {index}: no valid voice-over after {ANSWER_ATTEMPTS} attempts: {'; '.join(problems)}")
+    raise ReorderError(f"Video {index}: no valid voice-over after {ANSWER_ATTEMPTS} attempts: "
+                       f"{'; '.join(problems)}", E_INVALID_ANSWER)
 
 
 def main() -> int:
@@ -316,7 +320,7 @@ def main() -> int:
 
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not api_key or api_key == KEY_PLACEHOLDER:
-            raise ReorderError("GEMINI_API_KEY is not set (fill it in .env, then recreate the container)")
+            raise ReorderError("GEMINI_API_KEY is not set (fill it in .env, then recreate the container)", E_AUTH)
 
         # Keep the voice-overs of videos not regenerated in this run.
         existing = {}
@@ -345,11 +349,11 @@ def main() -> int:
             "videos": [results[k] for k in sorted(results)],
         })
     except ReorderError as exc:
-        log(str(exc))
+        print(format_error("gemini_voiceover", exc), file=sys.stderr)
         print("fail")
         return 1
     except Exception as exc:  # noqa: BLE001 - always answer json/fail
-        log(f"Unexpected error: {exc!r}")
+        print(format_error("gemini_voiceover", GeminiError(f"{exc!r}", E_UNEXPECTED)), file=sys.stderr)
         print("fail")
         return 1
 
