@@ -1,0 +1,127 @@
+{
+  "name": "88mobile_ui",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Mẫu thu thập thông tin video sản phẩm douyin",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Đường dẫn đến video sản phẩm trên douyin"
+            }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        -736,
+        -48
+      ],
+      "id": "8fda6756-0970-4eea-a6be-20254f4be4ea",
+      "name": "On form submission",
+      "webhookId": "190e15f0-51e0-4972-9368-9623e4eb09f6"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "DFWxtX6yNHTW20wS",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/DFWxtX6yNHTW20wS",
+          "cachedResultName": "88mobile_core"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "douyinUrl": "={{ $json['Đường dẫn đến video sản phẩm trên douyin'] }}"
+          },
+          "matchingColumns": [
+            "douyinUrl"
+          ],
+          "schema": [
+            {
+              "id": "douyinUrl",
+              "displayName": "douyinUrl",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        -480,
+        -48
+      ],
+      "id": "ef40e123-2002-4411-a98d-d4455cf3b673",
+      "name": "Sản xuất video"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "returnBinary",
+        "completionTitle": "Rất chân thành cám ơn quý khách đã sử dụng dịch vụ!",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        -224,
+        -48
+      ],
+      "id": "aba155ea-b3fc-40e6-aa5a-e6bf4968d1ed",
+      "name": "Form",
+      "webhookId": "1e9c1989-4a39-4633-9841-d53af751ebbf"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Sản xuất video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sản xuất video": {
+      "main": [
+        [
+          {
+            "node": "Form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "4a19b709-3965-4124-b626-f286fabfda28",
+  "meta": {
+    "instanceId": "e82d21276fd2c15d8c7594a7dcd1d0ea17f6e5e6c833f1173f5d5a67c49c0209"
+  },
+  "nodeGroups": [],
+  "id": "cKkDvDCXtVPgoBP4",
+  "tags": []
+}

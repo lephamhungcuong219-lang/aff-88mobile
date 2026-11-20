@@ -13,10 +13,12 @@ Stdout: exactly 'done' or 'fail'.
 Stderr: the reason for a failure (human-readable).
 Exit code: 0 for success, 1 for failure.
 
-Directories that already exist count as success.
+Directories that already exist count as success. Missing parents (e.g. /data/media
+and /data/media/jobs) are created too.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -28,6 +30,20 @@ def fail(reason: str) -> int:
     print(f"[make_dir] {reason}", file=sys.stderr)
     print("fail")
     return 1
+
+
+def broken_mount(path: Path) -> Path | None:
+    """The first parent that the system lists but cannot open, or None."""
+    for parent in reversed(path.parents):
+        try:
+            os.stat(parent)
+        except FileNotFoundError:
+            if parent.name in os.listdir(parent.parent):
+                return parent
+            return None
+        except OSError:
+            return parent
+    return None
 
 
 def main() -> int:
@@ -43,8 +59,13 @@ def main() -> int:
         if path.exists() and not path.is_dir():
             return fail(f"Path exists but is not a directory: {path}")
         try:
-            path.mkdir(parents=True, exist_ok=True)
+            path.mkdir(parents=True, exist_ok=True)  # creates every missing parent too
         except OSError as exc:
+            broken = broken_mount(path)
+            if broken:
+                return fail(f"Could not create {path}: {broken} is listed but cannot be opened. It is "
+                            f"probably a bind mount whose host folder was deleted while the container was "
+                            f"running: create the host folder again (./media) or restart the container")
             return fail(f"Could not create {path}: {exc}")
 
     print("done")

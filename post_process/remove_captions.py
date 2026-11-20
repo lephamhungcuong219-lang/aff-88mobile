@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Detect small burned-in captions in scene clips and remove them (no AI).
+"""Detect small burned-in captions in scene clips, and optionally remove them (no AI).
 
 Usage:
-    python remove_captions.py <sources_dir> <output_dir> [--mode panel|fill] [--preview DIR]
+    python remove_captions.py <sources_dir> <output_dir> [--mode detect|panel|fill] [--preview DIR]
 
-Every <sources_dir>/<N>.mp4 goes through the process and ends up as
-<output_dir>/<N>.mp4: re-encoded with the caption removed, or copied as is when
-no caption is found. A report is written to <output_dir>/captions.json.
+detect (default) only writes the report <output_dir>/captions.json: where and when
+each clip shows a caption ("text_box": the text itself, no padding). No clip is
+written; compose_videos.py covers the captions with its subtitle glass panel, so
+the final videos are rendered straight from <sources_dir> and encoded once less.
+
+panel / fill also process every <sources_dir>/<N>.mp4 into <output_dir>/<N>.mp4:
+re-encoded with the caption removed, or copied as is when no caption is found.
 
 Finding captions (classic image processing, OpenCV + numpy only):
   1. Each clip is sampled at SAMPLE_FPS, downscaled to ANALYSIS_WIDTH.
@@ -21,7 +25,7 @@ Finding captions (classic image processing, OpenCV + numpy only):
   5. Per clip, the kept boxes are merged into one region covering the whole
      sentence, with the time span in which it is visible.
 
-Removing captions (only inside the region and time span):
+Removing captions (panel / fill only; only inside the region and time span):
     A stable mask is built for the caption: glyph pixels, their drop shadow /
     outline (pixels much darker than the local background, right next to the
     glyphs) and the glow of coloured words, seen in enough frames.
@@ -36,7 +40,8 @@ Removing captions (only inside the region and time span):
 Only the caption region is processed in Python (at analysis resolution, which
 is enough for a smooth fill); ffmpeg overlays it back onto the full-size video.
 
---preview DIR saves, per clip with a caption, the region before/after.
+--preview DIR saves, per clip with a caption, the region before/after (panel / fill),
+or one frame with the detected text box drawn in green (detect).
 
 Stdout: 'dir:<absolute output_dir>' on success, or exactly 'fail'.
 Stderr: progress and the reason for a failure (human-readable).
@@ -260,6 +265,7 @@ def clip_region(items: list, line: tuple[float, float], duration: float) -> dict
     return {
         "x": rx0, "w": rx1 - rx0,
         "y": y0 - PAD_Y * height, "h": (y1 - y0) + 2 * PAD_Y * height,
+        "text": (x0, y0, x1 - x0, y1 - y0),  # the text itself: no padding, no edge margin
         "line_h": height, "start": round(start, 3), "end": round(end, 3), "hits": len(kept),
     }
 
@@ -337,6 +343,28 @@ def to_pixels(region: dict, width: int, height: int) -> tuple[int, int, int, int
     w = min(width - x, int(region["w"] * width + 3) // 4 * 4) // 4 * 4
     h = min(height - y, int(region["h"] * height + 3) // 4 * 4) // 4 * 4
     return x, y, w, h
+
+
+def text_pixels(region: dict, width: int, height: int) -> dict:
+    """The text box (fractions) -> pixels, rounded outwards, inside the frame."""
+    x, y, w, h = region["text"]
+    x0, y0 = max(0, int(np.floor(x * width))), max(0, int(np.floor(y * height)))
+    x1, y1 = min(width, int(np.ceil((x + w) * width))), min(height, int(np.ceil((y + h) * height)))
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
+def save_detect_preview(clip: Path, region: dict, text: dict, path: Path) -> None:
+    """One frame in the middle of the caption's time span, text box drawn in green (960 px wide)."""
+    t = (region["start"] + region["end"]) / 2
+    result = run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", str(clip), "-frames:v", "1",
+                  "-f", "image2pipe", "-vcodec", "png", "-"])
+    frame = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR) if result.stdout else None
+    if frame is None:
+        return
+    cv2.rectangle(frame, (text["x"], text["y"]), (text["x"] + text["w"], text["y"] + text["h"]),
+                  (0, 255, 0), max(2, frame.shape[1] // 400))
+    scale = 960 / frame.shape[1]
+    cv2.imwrite(str(path), cv2.resize(frame, (960, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA))
 
 
 def in_window(index: int, fps: float, region: dict) -> bool:
@@ -500,10 +528,10 @@ def save_preview(before: np.ndarray, after: np.ndarray, path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Detect and remove small burned-in captions in scene clips.")
     parser.add_argument("sources_dir", type=Path, help="Directory with <N>.mp4 scene clips")
-    parser.add_argument("output_dir", type=Path, help="Directory for the cleaned clips")
-    parser.add_argument("--mode", choices=("panel", "fill"), default="panel",
-                        help="panel (default): frosted-glass rectangle over the removed caption; "
-                             "fill: only remove the glyphs")
+    parser.add_argument("output_dir", type=Path, help="Directory for captions.json (and the cleaned clips: panel/fill)")
+    parser.add_argument("--mode", choices=("detect", "panel", "fill"), default="detect",
+                        help="detect (default): only write captions.json (compose_videos covers the captions); "
+                             "panel: frosted-glass rectangle over the removed caption; fill: only remove the glyphs")
     parser.add_argument("--preview", type=Path, help="Directory for before/after preview images")
     args = parser.parse_args()
 
@@ -544,7 +572,7 @@ def main() -> int:
         if line:
             report["caption_line"] = {"center_y": round(line[0], 4), "height": round(line[1], 4)}
 
-        counts = {"panel": 0, "fill": 0}
+        counts = {"panel": 0, "fill": 0, "detect": 0}
         for clip in clips:
             info = infos[clip.name]
             target = out_dir / clip.name
@@ -558,12 +586,26 @@ def main() -> int:
                 region = clip_region(found, line, info["duration"])
                 detection = "band"
             if region is None:
-                shutil.copyfile(clip, target)
+                if args.mode != "detect":
+                    shutil.copyfile(clip, target)
                 report["clips"][clip.name] = {"caption": False}
                 continue
 
             # The region is already centred on the frame (see clip_region) and inside the margins.
             box = to_pixels(region, info["width"], info["height"])
+            text = text_pixels(region, info["width"], info["height"])
+            if args.mode == "detect":
+                counts["detect"] += 1
+                report["clips"][clip.name] = {
+                    "caption": True, "method": "detect", "glyphs_removed": False, "detection": detection,
+                    "box": dict(zip(("x", "y", "w", "h"), box)), "text_box": text,
+                    "start": region["start"], "end": region["end"], "hits": region["hits"],
+                }
+                if preview_dir:
+                    save_detect_preview(clip, region, text, preview_dir / f"{clip.stem}.jpg")
+                log(f"{clip.name}: detect ({detection}) text={tuple(text.values())} "
+                    f"{region['start']:.2f}-{region['end']:.2f}s")
+                continue
             scale = ANALYSIS_WIDTH / info["width"]
             method = args.mode
             mask = build_mask(clip, info, box, region, scale)
@@ -578,7 +620,7 @@ def main() -> int:
             counts[method] += 1
             report["clips"][clip.name] = {
                 "caption": True, "method": method, "glyphs_removed": mask is not None, "detection": detection,
-                "box": dict(zip(("x", "y", "w", "h"), box)),
+                "box": dict(zip(("x", "y", "w", "h"), box)), "text_box": text,
                 "start": region["start"], "end": region["end"], "hits": region["hits"],
                 "mask_share": None if share is None else round(share, 3),
             }
@@ -586,8 +628,12 @@ def main() -> int:
                 + ("" if share is None else f" mask={share:.2f}"))
 
         (out_dir / "captions.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        log(f"{len(clips)} clips: {counts['panel']} panel, {counts['fill']} fill, "
-            f"{len(clips) - counts['panel'] - counts['fill']} without caption")
+        found = sum(counts.values())
+        if args.mode == "detect":
+            log(f"{len(clips)} clips: {found} with caption, {len(clips) - found} without (report only)")
+        else:
+            log(f"{len(clips)} clips: {counts['panel']} panel, {counts['fill']} fill, "
+                f"{len(clips) - found} without caption")
     except CaptionError as exc:
         log(str(exc))
         print("fail")

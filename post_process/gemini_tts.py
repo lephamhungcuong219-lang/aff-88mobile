@@ -286,6 +286,20 @@ def split_lines(samples: np.ndarray, counts: list[int]) -> tuple[float, float, l
     return start, end, bounds, "silence"
 
 
+def quietest_point(samples: np.ndarray, a: float, b: float) -> int:
+    """Sample index of the quietest 10 ms frame between a and b seconds (a pause between two
+    lines), at a zero crossing, so added silence never splits a sound."""
+    window = SAMPLE_RATE // 100
+    lo, hi = int(a * SAMPLE_RATE), int(b * SAMPLE_RATE)
+    if hi - lo < window:
+        return (lo + hi) // 2
+    frames = samples[lo:lo + (hi - lo) // window * window].astype(np.float32).reshape(-1, window)
+    best = lo + int(np.argmin((frames ** 2).mean(axis=1))) * window
+    part = samples[best:best + window].astype(np.int32)
+    crossings = np.flatnonzero(np.diff(np.sign(part)) != 0)
+    return best + (int(crossings[len(crossings) // 2]) + 1 if crossings.size else window // 2)
+
+
 def write_wav(path: Path, samples: np.ndarray) -> None:
     with wave.open(str(path), "wb") as wav:
         wav.setnchannels(1)
@@ -384,9 +398,11 @@ def render_video(video: dict, out_dir: Path, voice: str, accent: str, api_key: s
     if duration and natural < target_end - FILL_TOLERANCE_S and method == "silence" and len(timings) > 1:
         per_gap = min(MAX_EXTRA_PAUSE_S, (target_end - natural) / (len(timings) - 1))
         gap = np.zeros(int(per_gap * SAMPLE_RATE), dtype="<i2")
+        # Cut points in the ORIGINAL track, all taken before any timing is shifted (shifting
+        # first would move every later cut by the gaps already added, into the speech).
+        cuts = [quietest_point(track, timings[k]["end"], timings[k + 1]["start"]) for k in range(len(timings) - 1)]
         pieces, cursor = [], 0
-        for k in range(len(timings) - 1):
-            cut = int((timings[k]["end"] + timings[k + 1]["start"]) / 2 * SAMPLE_RATE)
+        for k, cut in enumerate(cuts):
             pieces += [track[cursor:cut], gap]
             cursor = cut
             for t in timings[k + 1:]:

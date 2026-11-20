@@ -6,7 +6,7 @@
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
       "position": [
-        -496,
+        -528,
         -80
       ],
       "id": "018ebd12-f608-4775-8ef4-13f54c255259",
@@ -19,8 +19,8 @@
       "type": "n8n-nodes-base.executeCommand",
       "typeVersion": 1,
       "position": [
-        -224,
-        -288
+        -240,
+        -304
       ],
       "id": "d537ae72-95d7-4fdb-b7ba-1d9310c809d6",
       "name": "Tạo thư mục lưu trữ"
@@ -35,7 +35,7 @@
           "cachedResultName": "Douyin Video Downloader & Scraper - No Watermark (hgservices/douyin-scraper)",
           "cachedResultUrl": "https://console.apify.com/actors/NaJlT9yHmCzCyHHuC/input"
         },
-        "customBody": "{\n  \"startUrls\": [\n    \"https://v.douyin.com/eeyYkYGUHOg/\"\n  ]\n}",
+        "customBody": "={\n  \"startUrls\": [\n    \"{{ $json.douyinUrl }}\"\n  ]\n} ",
         "timeout": {},
         "memory": 4096,
         "maxTotalChargeUsd": {}
@@ -122,7 +122,7 @@
     },
     {
       "parameters": {
-        "command": "=python -m post_process.render_videos \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/reorder.json\" \"{{ $json.stdout.trim().replace(/^dir:/, '') }}\" \"{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(0, -3).join('/') }}/output\" --proxy-dir \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/proxy\" --proxy-clips \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/sources\" --prefix \"{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(-2, -1)[0] }}_\""
+        "command": "=uv run python -m post_process.render_videos \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/reorder.json\" \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '/sources') }}\" \"{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(0, -3).join('/') }}/output\" --proxy-dir \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/proxy\" --proxy-clips \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/sources\" --prefix \"{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(-2, -1)[0] }}_\""
       },
       "type": "n8n-nodes-base.executeCommand",
       "typeVersion": 1,
@@ -171,6 +171,25 @@
       ],
       "id": "3283078e-0741-4851-a6c2-c6df31018fce",
       "name": "Ghép thoại vào video và hoàn tất quá trình"
+    },
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "douyinUrl"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -528,
+        -304
+      ],
+      "id": "0a00ceaf-0b32-4e9a-b631-4888bb3e4a5a",
+      "name": "When Executed by Another Workflow"
     }
   ],
   "pinData": {},
@@ -289,6 +308,22 @@
           }
         ]
       ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Tạo thư mục lưu trữ",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Lấy thông tin video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": false,
@@ -296,7 +331,7 @@
     "executionOrder": "v1",
     "binaryMode": "separate"
   },
-  "versionId": "f501d0d9-8778-4105-a37a-d377ce863cf3",
+  "versionId": "fabba7da-fbda-42eb-969b-6debeae043b4",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "e82d21276fd2c15d8c7594a7dcd1d0ea17f6e5e6c833f1173f5d5a67c49c0209"

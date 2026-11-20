@@ -3,7 +3,7 @@
 Tài liệu mô tả flow hiện tại trên n8n: từ dữ liệu Douyin (Apify) đến các video ngắn đã dựng lại,
 đã che caption tiếng Trung và có lời thoại tiếng Việt (chưa có giọng đọc).
 
-Cập nhật: 2026-11-19.
+Cập nhật: 2026-11-20.
 
 ## Tổng quan
 
@@ -16,11 +16,11 @@ Apify (JSON Douyin)
 3. split_video       cắt video thành các cảnh (clip) + scenelog
 4. compress_clips    bản nhỏ của các clip để gửi Gemini
 5. gemini_reorder    Gemini lên kế hoạch nhiều video ngắn (thứ tự cảnh)
-6. remove_captions   che caption tiếng Trung trên các clip gốc
-7. render_videos     ghép bản cuối (đã che caption) + bản proxy (gửi Gemini)
+6. remove_captions   dò vị trí + thời gian caption tiếng Trung (captions.json), không sửa clip
+7. render_videos     ghép bản cuối + bản proxy (gửi Gemini), cả hai từ clip gốc
 8. gemini_voiceover  Gemini viết lời thoại tiếng Việt cho từng video
 9. gemini_tts        Gemini TTS đọc lời thoại (giọng Puck), có timestamp từng câu
-10. compose_videos   ghép giọng đọc + phụ đề tiếng Việt trên tấm kính vào bản cuối
+10. compose_videos   ghép giọng đọc + phụ đề tiếng Việt; tấm kính che luôn caption tiếng Trung
   │
   ▼
 video hoàn chỉnh: <job>/output/final/
@@ -79,7 +79,7 @@ Bước 6 không phụ thuộc bước 4-5: có thể chạy ngay sau bước 3 
 │   ├── <awemeId>.mp4                 video tải về (H.264)                     [2]
 │   └── <awemeId>.mp3                 nhạc                                     [2]
 ├── output/
-│   ├── <awemeId>_video_<N>.mp4       video cuối, đã che caption, 4K           [7]
+│   ├── <awemeId>_video_<N>.mp4       video ghép, 4K, còn caption tiếng Trung  [7]
 │   └── final/<awemeId>_video_<N>.mp4 video hoàn chỉnh: giọng đọc + phụ đề    [10]
 └── temp/
     └── <awemeId>/
@@ -90,7 +90,7 @@ Bước 6 không phụ thuộc bước 4-5: có thể chạy ngay sau bước 3 
         ├── request.json              request gửi Gemini (lên kế hoạch)        [5]
         ├── gem_response.json         response gốc của Gemini                  [5]
         ├── reorder.json              kế hoạch các video + timestamp           [5]
-        ├── clean/<N>.mp4             các cảnh đã che caption                  [6]
+        ├── clean/<N>.mp4             các cảnh đã che caption (chỉ --mode panel|fill) [6]
         ├── clean/captions.json       báo cáo vùng caption của từng clip       [6]
         ├── proxy/proxy_<awemeId>_video_<N>.mp4   bản nhẹ 480x854, còn caption [7]
         ├── voiceover.json            lời thoại tiếng Việt                     [8]
@@ -105,7 +105,9 @@ Số trong ngoặc vuông là bước tạo ra file.
 
 ### 1. make_dir
 
-Tạo thư mục job cùng `input/`, `output/`, `temp/`.
+Tạo thư mục job cùng `input/`, `output/`, `temp/`, và mọi thư mục cha còn thiếu (`/data/media`, `/data/media/jobs`).
+Nếu thư mục `./media` trên máy bị xoá khi container đang chạy, mount `/data/media` bị hỏng: script báo `fail` kèm
+hướng dẫn (tạo lại `./media` hoặc khởi động lại container).
 
 | | |
 |---|---|
@@ -219,25 +221,30 @@ python -m post_process.gemini_reorder "{{ $json.stdout.trim().replace(/^dir:/, '
 
 ### 6. remove_captions
 
-Tìm caption nhỏ (dòng chữ cố định của video) bằng OpenCV, không dùng AI, rồi che bằng tấm kính mờ:
-hình chữ nhật bo góc, chữ bên dưới được xoá trước khi làm mờ. Tấm che **ôm sát câu chữ** (lề nhỏ), căn giữa theo
-khung hình (caption Douyin luôn căn giữa; nếu một bên bị dính vật sáng thì lấy theo bên gần tâm hơn) và **luôn cách
-mép khung hình ít nhất 3%**. Caption dài gần hết chiều ngang vẫn được nhận. Khi không nhận ra được theo dòng chữ (chữ dính vào
+Tìm caption nhỏ (dòng chữ cố định của video) bằng OpenCV, không dùng AI. Mặc định (`--mode detect`) **chỉ dò**:
+ghi vị trí và thời gian caption của từng clip vào `captions.json`, không encode clip nào. Việc che làm một lần duy
+nhất ở bước 10 (tấm kính phụ đề), nên video chỉ encode một lần ít hơn, không bị mờ hai lớp, và tấm kính chỉ cần ôm
+khung chữ thật (`text_box`, không đệm). Vùng chữ căn giữa theo khung hình (caption Douyin luôn căn giữa; nếu một
+bên bị dính vật sáng thì lấy theo bên gần tâm hơn).
+
+`--mode panel|fill` (cách cũ) che ngay trên clip: tấm kính mờ bo góc (`box`, có đệm, cách mép khung hình ít nhất 3%),
+chữ bên dưới được xoá trước khi làm mờ, và ghi clip vào `output_dir`; khi đó bước 7 phải lấy clip từ `clean/`. Caption dài gần hết chiều ngang vẫn được nhận. Khi không nhận ra được theo dòng chữ (chữ dính vào
 vật sáng phía sau, hoặc chữ to hơn caption nằm trên dòng caption), bước dự phòng đo chiều cao thật của chữ theo mật độ
 pixel từng hàng quanh dòng caption (chấp nhận chữ cao tới 2,4 lần caption, câu ngắn từ 2 chữ).
 Mọi chữ nằm trên dòng caption đều bị che (kể cả chữ to hơn caption); chữ overlay ở vị trí khác được giữ nguyên.
 
 | | |
 |---|---|
-| Lệnh | `python -m post_process.remove_captions <sources_dir> <output_dir> [--mode panel\|fill] [--preview DIR]` |
+| Lệnh | `python -m post_process.remove_captions <sources_dir> <output_dir> [--mode detect\|panel\|fill] [--preview DIR]` |
 | Input | `sources_dir`: `.../sources`; `output_dir`: `.../clean` (phải khác `sources_dir`) |
-| Output | `<output_dir>/<N>.mp4` (clip có caption thì encode lại, không có thì copy nguyên), `<output_dir>/captions.json` |
+| Output | `<output_dir>/captions.json`; với `panel\|fill` thêm `<output_dir>/<N>.mp4` (clip có caption thì encode lại, không có thì copy nguyên) |
 | stdout | `dir:<output_dir>` / `fail` |
 | Thời gian | khoảng 3-4 phút cho 40 clip 4K (đặt timeout node từ 10 phút) |
 
-`--mode fill`: chỉ xoá chữ, không có tấm kính. `--preview DIR`: lưu ảnh trước/sau của từng clip.
+`--mode fill`: chỉ xoá chữ, không có tấm kính. `--preview DIR`: lưu ảnh trước/sau của từng clip (`panel|fill`), hoặc
+một khung hình có vẽ khung chữ dò được màu xanh (`detect`).
 
-`captions.json`: `{"mode", "caption_line": {"center_y", "height"}, "clips": {"<N>.mp4": {"caption", "method", "glyphs_removed", "detection", "box": {"x","y","w","h"}, "start", "end", "hits", "mask_share"}}}`.
+`captions.json`: `{"mode", "caption_line": {"center_y", "height"}, "clips": {"<N>.mp4": {"caption", "method", "glyphs_removed", "detection", "box": {"x","y","w","h"}, "text_box": {"x","y","w","h"}, "start", "end", "hits", "mask_share"}}}`.
 
 Lệnh n8n (sau `gemini_reorder`, stdout `json:.../reorder.json`):
 ```
@@ -246,14 +253,14 @@ python -m post_process.remove_captions "{{ $json.stdout.trim().replace(/^json:/,
 
 ### 7. render_videos
 
-Ghép các cảnh theo `reorder.json`. Một lần chạy xuất cả **bản cuối** (từ `clean/`, chất lượng gốc) và **bản proxy**
-(từ `sources/`, còn caption, 480x854) để gửi Gemini. Hai bản có cùng cảnh, cùng thứ tự, cùng số khung hình.
+Ghép các cảnh theo `reorder.json`. Một lần chạy xuất cả **bản cuối** (chất lượng gốc) và **bản proxy** (480x854)
+để gửi Gemini, cả hai từ `sources/` nên còn caption tiếng Trung (bước 10 che). Hai bản có cùng cảnh, cùng thứ tự, cùng số khung hình.
 Mỗi video ghép đủ mọi cảnh, nguyên độ dài (không phải bản tóm tắt).
 
 | | |
 |---|---|
 | Lệnh | `python -m post_process.render_videos <reorder_json> <clips_dir> <output_dir> [--proxy-dir DIR] [--proxy-clips DIR] [--proxy-height 854] [--prefix TEXT] [--no-audio] [--height PX]` |
-| Input | `reorder_json`: `.../reorder.json`; `clips_dir`: `.../clean`; `output_dir`: `<job>/output`; `--proxy-dir`: `.../proxy`; `--proxy-clips`: `.../sources`; `--prefix`: `<awemeId>_` |
+| Input | `reorder_json`: `.../reorder.json`; `clips_dir`: `.../sources` (`.../clean` nếu bước 6 chạy `panel\|fill`); `output_dir`: `<job>/output`; `--proxy-dir`: `.../proxy`; `--proxy-clips`: `.../sources`; `--prefix`: `<awemeId>_` |
 | Output | `<output_dir>/<prefix>video_<N>.mp4`, `<proxy_dir>/proxy_<prefix>video_<N>.mp4` |
 | stdout | dòng 1 `dir:<output_dir>`, dòng 2 `proxy:<proxy_dir>` (khi có `--proxy-dir`) / `fail` |
 
@@ -263,7 +270,7 @@ Video được encode lại (H.264 CRF 20 + AAC 192k) để tránh lỗi âm tha
 
 Lệnh n8n (sau `remove_captions`, stdout `dir:.../clean`):
 ```
-python -m post_process.render_videos "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/clean$/, '') }}/reorder.json" "{{ $json.stdout.trim().replace(/^dir:/, '') }}" "{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(0, -3).join('/') }}/output" --proxy-dir "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/clean$/, '') }}/proxy" --proxy-clips "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/clean$/, '') }}/sources" --prefix "{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(-2, -1)[0] }}_"
+python -m post_process.render_videos "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/clean$/, '') }}/reorder.json" "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/clean$/, '/sources') }}" "{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(0, -3).join('/') }}/output" --proxy-dir "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/clean$/, '') }}/proxy" --proxy-clips "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/clean$/, '') }}/sources" --prefix "{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(-2, -1)[0] }}_"
 ```
 
 Lấy từng dòng stdout ở node sau: `{{ $json.stdout.match(/^dir:(.*)$/m)[1] }}`, `{{ $json.stdout.match(/^proxy:(.*)$/m)[1] }}`.
@@ -374,10 +381,13 @@ Ghép giọng đọc và phụ đề tiếng Việt vào video cuối (bước 7
 Phụ đề: chữ trắng đậm (Noto Sans Bold) có bóng, hiện đúng `start`-`end` của từng câu trong `tts.json`,
 đặt giữa một tấm kính mờ (hình chữ nhật bo góc, căn giữa khung hình, trên dòng caption).
 - **Kích thước cố định cho cả video** (không phóng to thu nhỏ): chiều dài lớn nhất và chiều cao lớn nhất trong số
-  nền của các câu tiếng Việt và các vùng che chữ Trung của `remove_captions` trong các cảnh của video
-  (lấy từ `captions.json` + `reorder.json`), nên không lộ mép tấm che cũ.
+  nền của các câu tiếng Việt và vùng chữ Trung trong các cảnh của video (lấy từ `captions.json` + `reorder.json`).
+- **Che luôn chữ Trung** (`captions.json` mode `detect`): vùng chữ Trung là `text_box` + lề an toàn 0,12 x chiều cao
+  dòng caption (viền/bóng chữ), không đệm thêm, luôn cách mép khung hình ít nhất 3%. Kính được làm mờ mạnh (0,85 x chiều cao dòng caption, như tấm che cũ)
+  để chữ không ánh qua; hiện cả khi `--no-subtitles`. Thiếu `reorder.json` thì `fail`.
+- Với `captions.json` mode `panel|fill` (cách cũ), tấm kính phủ lên tấm che cũ (`box` + 0,3% chiều cao) để không lộ mép.
 - **Hiện suốt video**, từ khung đầu đến khung cuối; giữa hai câu chỉ ẩn chữ, tấm kính vẫn còn.
-- Kính được giảm độ bão hoà màu (40%) để màu của caption đã xoá (ví dụ chữ vàng) không ánh qua.
+- Kính được giảm độ bão hoà màu (40%) để màu của caption (ví dụ chữ vàng) không ánh qua.
 - **Chữ nằm giữa tấm kính theo chiều dọc**, căn theo thân chữ (chiều cao chữ hoa), không tính dấu phía trên và đuôi
   chữ phía dưới, nên nhìn cân.
 - Độ rộng chữ được đo bằng chính font; câu quá dài (hơn 90% chiều ngang) thì thu nhỏ chữ, không dưới 1,8% chiều cao.
@@ -423,6 +433,6 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
   đo với giọng Puck; thực tế dao động 3,4-4,7 tuỳ câu, nên `gemini_tts` có bước tăng tốc nhẹ để khớp.
 - `gemini_tts`: ranh giới câu được đoán từ khoảng lặng (hoặc chia theo âm tiết khi không đoán được), nên phụ đề có thể
   lệch vài phần mười giây; bản dự phòng 3.1 là model preview, giọng có thể khác 3.8 dù cùng tên giọng.
-- `render_videos`: bản ở `output/` vẫn còn âm thanh gốc (lời tiếng Trung); bản hoàn chỉnh ở `output/final/` thì không.
+- `render_videos`: bản ở `output/` vẫn còn caption và âm thanh gốc tiếng Trung; bản hoàn chỉnh ở `output/final/` thì không.
 - `compose_videos`: tấm kính cố định theo câu/vùng che lớn nhất của video nên câu ngắn có thể có nhiều khoảng trống;
   chữ overlay lớn của video gốc (không nằm trên dòng caption) vẫn còn và có thể nằm sát tấm kính.

@@ -9,10 +9,18 @@ Usage:
 
 Inputs:
     tts_json    tts.json from gemini_tts.py (voice files + start/end of every line)
-    videos_dir  final videos from render_videos.py (<prefix>video_<N>.mp4, captions removed)
+    videos_dir  final videos from render_videos.py (<prefix>video_<N>.mp4)
     --reorder   reorder.json (default: next to tts.json): which scenes each video uses
-    --captions  captions.json from remove_captions.py (default: <tts dir>/clean/captions.json),
-                used so the new panel also covers the panels that hid the Chinese captions
+    --captions  captions.json from remove_captions.py (default: <tts dir>/clean/captions.json):
+                where and when each scene shows a Chinese caption, so the panel covers it
+
+Two kinds of captions.json (its "mode"):
+  detect        (default pipeline) the videos still show the Chinese captions. The panel
+                covers each caption's text box plus COVER_MARGIN only (no padding), and
+                its glass is blurred as strongly as remove_captions' own panel used to
+                be (COVER_BLUR), so no glyph shows through. This is the only cover.
+  panel / fill  the videos were rendered from clips already covered by remove_captions;
+                the panel grows over those old covers (OLD_COVER_OUTSET) to hide their edges.
 
 For every video in tts.json, writes <output_dir>/<same file name> with:
   - audio: the voice track only (original sound removed). Optional background music
@@ -50,7 +58,12 @@ FONT_FILE = Path("/usr/share/fonts/noto/NotoSans-Bold.ttf")
 FONT_SIZE = 0.026         # x height: subtitle font size
 MIN_FONT_SIZE = 0.018     # never smaller than this; longer lines fail instead
 MAX_PANEL_WIDTH = 0.90    # x width: a subtitle panel is never wider (longer lines get a smaller font)
-OLD_COVER_OUTSET = 0.003  # x height: grow old caption covers a little so their edges are hidden
+OLD_COVER_OUTSET = 0.003  # x height: grow old caption covers a little so their edges are hidden (panel/fill)
+COVER_MARGIN = 0.12       # x caption line height: safety margin around a Chinese text box (detect):
+                          # outline/shadow of the glyphs, samples the detection missed
+COVER_BLUR = 0.85         # x caption line height: glass blur over raw Chinese captions (detect)
+COVER_EDGE_MARGIN = 0.03  # x width: a Chinese cover never comes closer to the frame edges (as remove_captions'
+                          # own panel): a text box reaching the edge is bright background, not text (detect)
 PAD_X = 0.9               # x font size: space left/right of the longest line
 PAD_Y = 0.45              # x font size: space above/below the text
 DEFAULT_LINE_Y = 0.725    # caption line centre when captions.json is missing
@@ -129,21 +142,38 @@ def even(rect: Rect, width: int, height: int) -> Rect:
     return x, y, w, h
 
 
-def old_covers(plan_video: dict | None, captions: dict | None, outset: int) -> list[tuple[float, float, Rect]]:
-    """When and where remove_captions.py covered a Chinese caption, in this video's time."""
+def detect_mode(captions: dict | None) -> bool:
+    """True when captions.json only reports the captions: the videos still show them."""
+    return (captions or {}).get("mode") == "detect"
+
+
+def old_covers(plan_video: dict | None, captions: dict | None, width: int, height: int) -> list[tuple[float, float, Rect]]:
+    """When and where a Chinese caption must be covered, in this video's time.
+
+    detect: the text box plus COVER_MARGIN, kept COVER_EDGE_MARGIN off the frame edges.
+    panel/fill: remove_captions' own cover plus OLD_COVER_OUTSET, so its edge is hidden.
+    """
     if not plan_video or not captions:
         return []
     clips = captions.get("clips", {})
+    if detect_mode(captions):
+        line_h = float((captions.get("caption_line") or {}).get("height", 0.05))
+        outset, key = int(round(COVER_MARGIN * line_h * height)), "text_box"
+    else:
+        outset, key = int(OLD_COVER_OUTSET * height), "box"
     covers = []
     for scene in plan_video.get("scenes", []):
         info = clips.get(scene.get("source_file", ""))
-        if not (info and info.get("caption") and info.get("box")):
+        if not (info and info.get("caption") and (info.get(key) or info.get("box"))):
             continue
-        b = info["box"]
+        b = info.get(key) or info["box"]
         start = float(scene["out_start"]) + float(info.get("start", 0))
         end = min(float(scene["out_end"]), float(scene["out_start"]) + float(info.get("end", scene["duration"])))
         if end > start:
-            covers.append((start, end, (b["x"] - outset, b["y"] - outset, b["w"] + 2 * outset, b["h"] + 2 * outset)))
+            x0, x1 = b["x"] - outset, b["x"] + b["w"] + outset
+            if detect_mode(captions):
+                x0, x1 = max(x0, int(COVER_EDGE_MARGIN * width)), min(x1, int((1 - COVER_EDGE_MARGIN) * width))
+            covers.append((start, end, (x0, b["y"] - outset, x1 - x0, b["h"] + 2 * outset)))
     return covers
 
 
@@ -186,9 +216,16 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
 
     filters, inputs = [], ["-i", str(source), "-i", str(voice)]
     layout = None
-    if not args.no_subtitles and segments:
+    # Chinese captions to cover: in detect mode they are still in the video, so the panel
+    # is drawn even with --no-subtitles.
+    covers = old_covers(plan_video, captions, width, height)
+    with_text = not args.no_subtitles and bool(segments)
+    with_panel = with_text or bool(covers and detect_mode(captions))
+    if with_panel:
+        items, files, font = [], [], 0
+        line_y = (captions or {}).get("caption_line", {}).get("center_y", DEFAULT_LINE_Y) * height
+    if with_text:
         # Text files (no escaping problems) and measurements.
-        files = []
         for i, seg in enumerate(segments):
             path = work / f"v{index}_line{i}.txt"
             path.write_text(seg["text"], encoding="utf-8")
@@ -207,21 +244,23 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
         _, top, bottom = measure_text(reference, font)
         text_h = bottom - top
 
-        # What must be covered, and when:
-        #   - each Vietnamese line: a panel around that line only, while it is spoken;
-        #   - each Chinese caption cover left by remove_captions.py: its own box, while it is there.
-        # At every moment the panel is the union, i.e. the bigger of the two; nothing -> no panel.
-        line_y = (captions or {}).get("caption_line", {}).get("center_y", DEFAULT_LINE_Y) * height
-        items = []
+        # What the panel must hold: each Vietnamese line with its padding.
         for seg, text_w in zip(segments, widths):
             w = text_w + 2 * PAD_X * font
             h = text_h + 2 * PAD_Y * font
             items.append((float(seg["start"]), float(seg["end"]),
                           (int(width / 2 - w / 2), int(line_y - h / 2), int(w), int(h))))
-        items += old_covers(plan_video, captions, int(OLD_COVER_OUTSET * height))
+    if with_panel:
+        # ... and what it must hide: every Chinese caption of this video's scenes.
+        # One fixed panel, as big as the biggest of them (see plan_panels).
+        items += covers
         panels = plan_panels(items, duration, width, height)
 
         tint = TINTS[args.tint]
+        blur = BLUR_SIGMA * height
+        if covers and detect_mode(captions):
+            line_h = float((captions.get("caption_line") or {}).get("height", 0.05))
+            blur = max(blur, COVER_BLUR * line_h * height)  # the raw glyphs must not show through
         if panels:
             labels = "".join(f"[cut{k}]" for k in range(len(panels)))
             filters.append(f"[0:v]split={len(panels) + 1}[base]{labels}")
@@ -232,7 +271,7 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
             panel_mask(mask, pw, ph)
             inputs += ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(mask)]
             # Desaturated glass: the colour of a removed caption (e.g. yellow) does not show through.
-            filters.append(f"[cut{k}]crop={pw}:{ph}:{px}:{py},gblur=sigma={BLUR_SIGMA * height:.1f},"
+            filters.append(f"[cut{k}]crop={pw}:{ph}:{px}:{py},gblur=sigma={blur:.1f},"
                            f"hue=s={GLASS_SATURATION},"
                            f"colorchannelmixer=rr={tint}:gg={tint}:bb={tint},format=rgba[glass{k}]")
             filters.append(f"[{first_mask_input + k}:v]format=gray,scale={pw}:{ph}[mask{k}]")
@@ -249,19 +288,20 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
         # Text: one drawtext per line, centred in the panel. The optical centre of a line is
         # the body of the letters (cap height: top of "H" to the baseline); accents above and
         # descenders below are left out, otherwise every line sits visibly too low.
-        centre = panels[0][0][1] + panels[0][0][3] / 2 if panels else line_y
-        cap_file = work / "cap.txt"
-        cap_file.write_text("H", encoding="utf-8")
-        _, cap_top, cap_bottom = measure_text(cap_file, font)
-        text_y = int(round(centre - (cap_top + cap_bottom) / 2))
-        shadow = max(1, int(SHADOW * font))
-        for seg, path in zip(segments, files):
-            chain += (f",drawtext=fontfile={ffmpeg_path(FONT_FILE)}:textfile={ffmpeg_path(path)}:"
-                      f"fontsize={font}:fontcolor=white:shadowcolor=black@0.45:shadowx={shadow}:shadowy={shadow}:"
-                      f"x=(w-text_w)/2:y={text_y}:y_align=font:"
-                      f"enable='between(t,{seg['start']:.3f},{seg['end']:.3f})'")
+        if with_text:
+            centre = panels[0][0][1] + panels[0][0][3] / 2 if panels else line_y
+            cap_file = work / "cap.txt"
+            cap_file.write_text("H", encoding="utf-8")
+            _, cap_top, cap_bottom = measure_text(cap_file, font)
+            text_y = int(round(centre - (cap_top + cap_bottom) / 2))
+            shadow = max(1, int(SHADOW * font))
+            for seg, path in zip(segments, files):
+                chain += (f",drawtext=fontfile={ffmpeg_path(FONT_FILE)}:textfile={ffmpeg_path(path)}:"
+                          f"fontsize={font}:fontcolor=white:shadowcolor=black@0.45:shadowx={shadow}:shadowy={shadow}:"
+                          f"x=(w-text_w)/2:y={text_y}:y_align=font:"
+                          f"enable='between(t,{seg['start']:.3f},{seg['end']:.3f})'")
         filters.append(chain + "[v]")
-        layout = {"font_size": font, "tint": args.tint,
+        layout = {"font_size": font or None, "tint": args.tint, "blur": round(blur, 1),
                   "panels": [{"x": r[0], "y": r[1], "w": r[2], "h": r[3], "times": s} for r, s in panels]}
     else:
         filters.append("[0:v]null[v]")
@@ -358,8 +398,12 @@ def main() -> int:
                          False, "reorder.json")
         captions = load_json(args.captions.expanduser().resolve() if args.captions
                              else tts_file.parent / "clean" / "captions.json", False, "captions.json")
+        if detect_mode(captions) and plan is None:
+            raise ComposeError("captions.json says the videos still show the Chinese captions (mode detect), "
+                               "but reorder.json was not found: cannot tell where to cover them")
         if plan is None or captions is None:
-            log("reorder.json or captions.json not found: the panel is sized for the subtitles only")
+            log("WARNING: reorder.json or captions.json not found: the panel is sized for the subtitles only; "
+                "Chinese captions still in the videos would show")
         plan_videos = {v.get("video_index"): v for v in (plan or {}).get("videos", [])}
         audio_dir = Path(tts.get("audio_dir") or tts_file.parent / "voice")
 

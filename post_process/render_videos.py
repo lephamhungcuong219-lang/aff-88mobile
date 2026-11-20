@@ -12,12 +12,13 @@ are joined, whole, in "position" order into
 
 With --proxy-dir, the same run also renders a light copy of every video:
     <proxy_dir>/proxy_<prefix>video_<video_index>.mp4      proxy video
-from --proxy-clips (default: clips_dir; normally the original clips, captions
-kept, so Gemini can read them), --proxy-height px high (default 854, i.e. 480 px
+from --proxy-clips (default: clips_dir; the original clips, captions kept, so
+Gemini can read them), --proxy-height px high (default 854, i.e. 480 px
 wide for 9:16). Same scenes, same order, same length: only smaller.
 
-Typical call:
-    render_videos.py reorder.json clean/ output/ --proxy-dir proxy/ --proxy-clips sources/
+Typical call (captions are covered later by compose_videos.py, see remove_captions.py
+--mode detect, so the final videos and the proxies both come from the original clips):
+    render_videos.py reorder.json sources/ output/ --proxy-dir proxy/ --proxy-clips sources/
 
 Each rendered video (final and proxy) is checked against the plan: its length
 must match "total_duration" within DURATION_TOLERANCE_S, otherwise the run fails.
@@ -184,7 +185,7 @@ def render_checked(video: dict, clips_dir: Path, target: Path, audio: bool, heig
 def main() -> int:
     parser = argparse.ArgumentParser(description="Join scene clips into the videos planned in reorder.json.")
     parser.add_argument("reorder_json", type=Path, help="reorder.json from gemini_reorder.py")
-    parser.add_argument("clips_dir", type=Path, help="Clips for the final videos (normally captions removed)")
+    parser.add_argument("clips_dir", type=Path, help="Clips for the final videos (normally sources)")
     parser.add_argument("output_dir", type=Path, help="Directory for the final videos")
     parser.add_argument("--proxy-dir", type=Path, help="Also render light proxy videos into this directory")
     parser.add_argument("--proxy-clips", type=Path, help="Clips for the proxies (default: clips_dir; normally sources)")
@@ -231,7 +232,8 @@ def main() -> int:
                 continue
             missing = [n for n in needed if not n or not (folder / n).is_file()]
             if missing:
-                hint = " (did remove_captions.py run into it?)" if folder.name == "clean" else ""
+                hint = (" (remove_captions.py --mode detect writes no clips: use sources/)"
+                        if folder.name == "clean" else "")
                 raise RenderError(f"{len(missing)}/{len(needed)} clips missing in {label} {folder}{hint}: "
                                   f"{', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''}")
 
