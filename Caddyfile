@@ -1,0 +1,8 @@
+{$N8N_HOST} {
+	encode zstd gzip
+
+	reverse_proxy n8n:5678 {
+		# Không buffer, để webhook streaming / SSE trả về ngay
+		flush_interval -1
+	}
+}

@@ -1,0 +1,126 @@
+
+services:
+  n8n:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        N8N_VERSION: ${N8N_VERSION:-stable}
+
+    container_name: n8n-media
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    # Chỉ mở ra localhost. Trên VPS, Caddy (bên dưới) sẽ public n8n qua HTTPS.
+    ports:
+      - "127.0.0.1:5678:5678"
+
+    environment:
+      # Timezone
+      TZ: Asia/Ho_Chi_Minh
+      GENERIC_TIMEZONE: Asia/Ho_Chi_Minh
+
+      # n8n luôn lắng nghe ở 5678 trong container (Caddy proxy vào cổng này)
+      N8N_PORT: "5678"
+
+      # Security
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-false}
+      N8N_PROXY_HOPS: ${N8N_PROXY_HOPS:-0}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+
+      # Public URLs (WEBHOOK_URL đã deprecated, dùng N8N_WEBHOOK_URL)
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL:-http://localhost:5678/}
+
+      # Binary storage
+      N8N_DEFAULT_BINARY_DATA_MODE: filesystem
+      N8N_RESTRICT_FILE_ACCESS_TO: /data/media
+
+      # Enable Execute Command
+      NODES_EXCLUDE: "[]"
+
+      # Task runner: giữ hành vi hiện tại, chỉ ghi rõ để tắt cảnh báo deprecation
+      N8N_RUNNERS_TASK_TIMEOUT: "300"
+
+      # Execution data pruning
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "24"
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: "1000"
+
+      # Reduce execution history storage
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "false"
+
+      # External PostgreSQL (Supabase)
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: ${SUPABASE_DB_HOST}
+      DB_POSTGRESDB_PORT: ${SUPABASE_DB_PORT:-5432}
+      DB_POSTGRESDB_DATABASE: ${SUPABASE_DB_NAME:-postgres}
+      DB_POSTGRESDB_USER: ${SUPABASE_DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${SUPABASE_DB_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: n8n
+
+      # Connection pool: mặc định của n8n (2 kết nối, timeout 20s, đóng kết nối rảnh sau 30s)
+      # quá nhỏ cho Supabase ở xa -> "timeout exceeded when trying to connect"
+      # và "Cannot use a pool after calling end on the pool".
+      DB_POSTGRESDB_POOL_SIZE: ${DB_POSTGRESDB_POOL_SIZE:-8}
+      DB_POSTGRESDB_CONNECTION_TIMEOUT: ${DB_POSTGRESDB_CONNECTION_TIMEOUT:-60000}
+      DB_POSTGRESDB_IDLE_CONNECTION_TIMEOUT: ${DB_POSTGRESDB_IDLE_CONNECTION_TIMEOUT:-300000}
+
+      # PostgreSQL SSL
+      DB_POSTGRESDB_SSL_ENABLED: "true"
+      DB_POSTGRESDB_SSL_CA_FILE: /run/secrets/prod-ca-2021.crt
+
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - ./media:/data/media
+      - ./certs/prod-ca-2021.crt:/run/secrets/prod-ca-2021.crt:ro
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:5678/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+    networks:
+      - n8n-network
+
+  # Reverse proxy + HTTPS tự động (Let's Encrypt). Chỉ chạy khi COMPOSE_PROFILES=proxy (trên VPS).
+  caddy:
+    image: caddy:2-alpine
+    container_name: n8n-caddy
+    restart: unless-stopped
+    profiles: ["proxy"]
+
+    depends_on:
+      n8n:
+        condition: service_healthy
+
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+
+    environment:
+      N8N_HOST: ${N8N_HOST}
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+    networks:
+      - n8n-network
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  n8n-network:
+    driver: bridge

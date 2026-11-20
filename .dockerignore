@@ -1,0 +1,17 @@
+node_modules
+npm-debug.log
+Dockerfile
+.dockerignore
+.git
+.gitignore
+.env
+.env.*
+dist
+coverage
+*.log
+
+# Dữ liệu runtime, không cần đưa vào build context
+n8n_data
+media
+certs
+pnpm-lock.yaml
