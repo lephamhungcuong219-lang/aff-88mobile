@@ -67,6 +67,7 @@ ZONE_TOP, ZONE_BOTTOM = 0.45, 0.95
 LINE_H_MIN, LINE_H_MAX = 0.010, 0.080  # up to bigger text sitting on the caption line
 CENTER_X_MIN, CENTER_X_MAX = 0.30, 0.70
 MIN_ASPECT = 2.5          # width / height of a caption line
+MAX_LINE_WIDTH = 0.995    # x width: long captions can run almost edge to edge
 FILL_MIN, FILL_MAX = 0.06, 0.65
 
 # Dominant caption line
@@ -80,14 +81,19 @@ MIN_HITS_PER_CLIP = 2     # samples a caption must appear in
 
 # Band fallback: for clips where no line-shaped caption was found (e.g. the
 # caption touches bright background), look for text pixels inside the caption band.
-BAND_HALF = 0.65          # x line height: half height of the band around the line
+BAND_REACH = 1.6          # x line height: rows searched above/below the line for the text
+BAND_COLUMNS = 0.9        # x width: central part of the frame used to measure row density
+BAND_ROW_SHARE = 0.35     # a row belongs to the text when its density reaches this share of the peak
+BAND_COLUMN_MIN = 0.04    # a column belongs to the text when this share of its rows is text
+BAND_MIN_ASPECT = 1.8     # width / height: short captions of two characters are accepted
 BAND_DENSITY_MIN = 0.06   # text pixel share inside the band (over the text's width)
 BAND_CONTRAST = 3.0       # band density must exceed the strips above/below this many times
 BAND_EDGE = 0.3           # x line height: strips right above/below the band
 
 # Region around the sentence
-PAD_Y = 0.55              # x line height, added above and below
-PAD_X = 0.7               # x line height, added left and right
+PAD_Y = 0.30              # x line height, added above and below (cover fits the text)
+PAD_X = 0.35              # x line height, added left and right
+EDGE_MARGIN = 0.03        # x width: the cover never comes closer than this to the frame edges
 
 # Mask (sizes relative to the line height, in analysis pixels)
 MASK_PRESENCE = 0.25      # pixel kept if masked in this share of the caption's frames
@@ -189,7 +195,7 @@ def find_lines(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
         x, y, bw, bh, _ = stats[i]
         if not (LINE_H_MIN * h <= bh <= LINE_H_MAX * h):
             continue
-        if bw < MIN_ASPECT * bh or bw > 0.95 * w:
+        if bw < MIN_ASPECT * bh or bw > MAX_LINE_WIDTH * w:
             continue
         if not (CENTER_X_MIN <= (x + bw / 2) / w <= CENTER_X_MAX):
             continue
@@ -227,8 +233,17 @@ def clip_region(items: list, line: tuple[float, float], duration: float) -> dict
             and LINE_H_RANGE[0] * height <= box[3] <= LINE_H_RANGE[1] * height]
     if len({t for t, _ in kept}) < MIN_HITS_PER_CLIP:
         return None
-    x0 = min(b[0] for _, b in kept)
-    x1 = max(b[0] + b[2] for _, b in kept)
+    # Captions are centred on the frame. A box that also caught something bright on ONE
+    # side (an icon, a light) is longer on that side only, so per frame the half width is
+    # the side closer to the centre; the sentence is the widest of those over the clip.
+    halves = [min(0.5 - b[0], b[0] + b[2] - 0.5) for _, b in kept]
+    halves = [h for h in halves if h > 0]
+    if halves:
+        half = max(halves)
+        x0, x1 = 0.5 - half, 0.5 + half
+    else:  # boxes not across the centre (not a centred caption): keep them as found
+        x0 = min(b[0] for _, b in kept)
+        x1 = max(b[0] + b[2] for _, b in kept)
     # Vertically: at least the caption band, more when the text on the line is taller.
     y0 = min([center - height / 2] + [b[1] for _, b in kept])
     y1 = max([center + height / 2] + [b[1] + b[3] for _, b in kept])
@@ -239,46 +254,80 @@ def clip_region(items: list, line: tuple[float, float], duration: float) -> dict
         start = 0.0          # caption already on screen at the cut
     if end >= duration - EDGE_SNAP_S:
         end = duration       # caption still on screen at the end
+    # Never reach the frame edges: keep EDGE_MARGIN on both sides.
+    rx0 = max(EDGE_MARGIN, x0 - PAD_X * height)
+    rx1 = min(1 - EDGE_MARGIN, x1 + PAD_X * height)
     return {
-        "x": x0 - PAD_X * height, "w": (x1 - x0) + 2 * PAD_X * height,
+        "x": rx0, "w": rx1 - rx0,
         "y": y0 - PAD_Y * height, "h": (y1 - y0) + 2 * PAD_Y * height,
         "line_h": height, "start": round(start, 3), "end": round(end, 3), "hits": len(kept),
     }
 
 
 def band_boxes(frame: np.ndarray, line: tuple[float, float]) -> tuple[float, float, float, float] | None:
-    """Caption box found by text density inside the caption band, or None."""
+    """Caption box found by text density around the caption line, or None.
+
+    Works where line detection fails (text touching other bright edges, big text on the
+    caption line). The text height is measured from the rows dense with text pixels around
+    the line, so text up to LINE_H_RANGE[1] x the caption height is accepted; thin long
+    edges (an arm, a table) have a low row density and do not count.
+    """
     h, w = frame.shape[:2]
     center, height = line[0] * h, line[1] * h
-    top, bottom = int(center - BAND_HALF * height), int(center + BAND_HALF * height)
-    strip = bottom - top
-    if top - strip < 0 or bottom + strip > h:
-        return None
+    reach = int(BAND_REACH * height)
+    lo, hi = max(0, int(center - reach)), min(h, int(center + reach))
     mask = text_mask(frame) > 0
+    x0c, x1c = int((1 - BAND_COLUMNS) / 2 * w), int((1 + BAND_COLUMNS) / 2 * w)
+    rows = mask[lo:hi, x0c:x1c].mean(axis=1)
+    if rows.size == 0 or rows.max() < BAND_DENSITY_MIN:
+        return None
+    # Rows of the text: the dense run that contains (or is closest to) the line centre.
+    dense = rows >= max(BAND_DENSITY_MIN / 2, BAND_ROW_SHARE * rows.max())
+    dense = cv2.morphologyEx(dense.astype(np.uint8)[:, None], cv2.MORPH_CLOSE,
+                             np.ones((max(3, int(0.25 * height)), 1), np.uint8))[:, 0] > 0
+    runs, start = [], None
+    for y, v in enumerate(list(dense) + [False]):
+        if v and start is None:
+            start = y
+        elif not v and start is not None:
+            runs.append((start, y))
+            start = None
+    if not runs:
+        return None
+    c = center - lo
+    top, bottom = min(runs, key=lambda r: 0 if r[0] <= c <= r[1] else min(abs(r[0] - c), abs(r[1] - c)))
+    text_h = bottom - top
+    if not (LINE_H_RANGE[0] * height <= text_h <= LINE_H_RANGE[1] * height):
+        return None
+    if abs((top + bottom) / 2 - c) > LINE_Y_TOLERANCE * height:
+        return None
+    top, bottom = top + lo, bottom + lo
+
     band = mask[top:bottom]
     # Columns with text, joined across the gaps between glyphs.
-    cols = band.any(axis=0).astype(np.uint8)[None, :]
-    cols = cv2.morphologyEx(cols, cv2.MORPH_CLOSE, np.ones((1, max(3, int(1.2 * height))), np.uint8))[0]
-    runs, start = [], None
+    cols = band.mean(axis=0) >= BAND_COLUMN_MIN
+    cols = cv2.morphologyEx(cols.astype(np.uint8)[None, :], cv2.MORPH_CLOSE,
+                            np.ones((1, max(3, int(1.2 * height))), np.uint8))[0]
+    col_runs, start = [], None
     for x, v in enumerate(list(cols) + [0]):
         if v and start is None:
             start = x
         elif not v and start is not None:
-            runs.append((start, x))
+            col_runs.append((start, x))
             start = None
-    runs = [(a, b) for a, b in runs if CENTER_X_MIN * w <= (a + b) / 2 <= CENTER_X_MAX * w
-            and b - a >= MIN_ASPECT * height]
-    if not runs:
+    col_runs = [(a, b) for a, b in col_runs if CENTER_X_MIN * w <= (a + b) / 2 <= CENTER_X_MAX * w
+                and b - a >= BAND_MIN_ASPECT * text_h]
+    if not col_runs:
         return None
-    x0, x1 = max(runs, key=lambda r: r[1] - r[0])
+    x0, x1 = max(col_runs, key=lambda r: r[1] - r[0])
     density = band[:, x0:x1].mean()
-    # Thin strips right outside the band: glyphs of a taller (overlay) text cross them.
+    # Thin strips right outside the text rows: glyphs of a taller text would cross them.
     edge = max(2, int(BAND_EDGE * height))
-    above = mask[top - edge:top, x0:x1].mean()
-    below = mask[bottom:bottom + edge, x0:x1].mean()
+    above = mask[max(0, top - edge):top, x0:x1].mean() if top > 0 else 0.0
+    below = mask[bottom:bottom + edge, x0:x1].mean() if bottom < h else 0.0
     if density < BAND_DENSITY_MIN or density < BAND_CONTRAST * max(above, below, 1e-6):
-        return None  # no text, or text taller than a caption (overlay title)
-    return x0 / w, (center - height / 2) / h, (x1 - x0) / w, height / h
+        return None
+    return x0 / w, top / h, (x1 - x0) / w, (bottom - top) / h
 
 
 def to_pixels(region: dict, width: int, height: int) -> tuple[int, int, int, int]:
@@ -513,10 +562,7 @@ def main() -> int:
                 report["clips"][clip.name] = {"caption": False}
                 continue
 
-            if args.mode == "panel":
-                # Centre the panel on the frame: symmetric around the middle, as wide as the sentence.
-                half = max(0.5 - region["x"], region["x"] + region["w"] - 0.5)
-                region["x"], region["w"] = 0.5 - half, 2 * half
+            # The region is already centred on the frame (see clip_region) and inside the margins.
             box = to_pixels(region, info["width"], info["height"])
             scale = ANALYSIS_WIDTH / info["width"]
             method = args.mode
@@ -526,9 +572,6 @@ def main() -> int:
             if not (low <= share <= high):
                 if method == "fill":
                     method = "panel"  # unreliable mask: never leave a smeared shape, use the panel
-                    half = max(0.5 - region["x"], region["x"] + region["w"] - 0.5)
-                    region["x"], region["w"] = 0.5 - half, 2 * half
-                    box = to_pixels(region, info["width"], info["height"])
                 mask = None  # panel only blurs, without removing glyphs first
             preview = preview_dir / f"{clip.stem}.jpg" if preview_dir else None
             process_clip(clip, target, info, box, region, method, mask, scale, preview)

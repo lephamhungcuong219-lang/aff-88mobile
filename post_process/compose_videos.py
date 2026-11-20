@@ -19,11 +19,15 @@ For every video in tts.json, writes <output_dir>/<same file name> with:
     (--music, looped, faded out) and/or the original sound at --original-volume.
   - subtitles: every line of tts.json shown from its start to its end, white bold
     text centred on a frosted-glass panel on the caption line.
-The panel is ONE fixed rounded rectangle for the whole video, centred on the frame:
-  wide enough for the longest Vietnamese line and for every caption panel left by
-  remove_captions.py in the scenes of this video, so the bar never jumps size at a
-  cut and no old panel edge shows. Text width is measured by rendering it with the
-  real font; when the longest line does not fit, the video uses a smaller font.
+The glass panel has ONE fixed size for the whole video (it never grows or shrinks): the
+  widest and the tallest of (a) every Vietnamese line with its padding and (b) every
+  Chinese caption cover from remove_captions.py in this video's scenes (captions.json,
+  mapped to this video's time with reorder.json), centred on the frame. It is shown from
+  the first to the last frame; between two lines only the text disappears.
+  The text is centred in the panel on the body of the letters (cap height), not on the
+  accents and descenders, so it looks vertically centred.
+  Text width is measured by rendering it with the real font; when the longest line
+  does not fit MAX_PANEL_WIDTH, the video uses a smaller font.
 
 Stdout: 'dir:<absolute output_dir>' on success, or exactly 'fail'.
 Stderr: progress and the reason for a failure (human-readable).
@@ -45,8 +49,8 @@ FONT_FILE = Path("/usr/share/fonts/noto/NotoSans-Bold.ttf")
 # Sizes relative to the video height / width
 FONT_SIZE = 0.026         # x height: subtitle font size
 MIN_FONT_SIZE = 0.018     # never smaller than this; longer lines fail instead
-MAX_FONT_SIZE = 0.032     # grown up to this when the panel has room to spare
-MAX_PANEL_WIDTH = 0.90    # x width
+MAX_PANEL_WIDTH = 0.90    # x width: a subtitle panel is never wider (longer lines get a smaller font)
+OLD_COVER_OUTSET = 0.003  # x height: grow old caption covers a little so their edges are hidden
 PAD_X = 0.9               # x font size: space left/right of the longest line
 PAD_Y = 0.45              # x font size: space above/below the text
 DEFAULT_LINE_Y = 0.725    # caption line centre when captions.json is missing
@@ -54,6 +58,7 @@ DEFAULT_LINE_Y = 0.725    # caption line centre when captions.json is missing
 # Glass look (same family as remove_captions.py)
 BLUR_SIGMA = 0.012        # x height
 TINTS = {"dark": 0.72, "light": 1.10}  # brightness factor of the glass
+GLASS_SATURATION = 0.4    # colour kept in the glass (0 = grey): hides coloured caption leftovers
 CORNER = 0.22             # x panel height
 SHADOW = 0.06             # x font size: text shadow offset
 
@@ -105,17 +110,59 @@ def measure_text(text_file: Path, font_size: int) -> tuple[int, int, int]:
     return int(cols[-1] - cols[0] + 1), int(rows[0] - font_size // 2), int(rows[-1] - font_size // 2)
 
 
-def caption_boxes(video: dict, plan_video: dict | None, captions: dict | None) -> list[dict]:
-    """Panels left by remove_captions.py in the scenes of this video."""
+Rect = tuple[int, int, int, int]  # x, y, w, h in pixels
+
+
+def union(a: Rect | None, b: Rect | None) -> Rect | None:
+    if a is None or b is None:
+        return a or b
+    x0, y0 = min(a[0], b[0]), min(a[1], b[1])
+    x1, y1 = max(a[0] + a[2], b[0] + b[2]), max(a[1] + a[3], b[1] + b[3])
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def even(rect: Rect, width: int, height: int) -> Rect:
+    """Even position/size, inside the frame."""
+    x, y = max(0, rect[0] // 2 * 2), max(0, rect[1] // 2 * 2)
+    w = min(width - x, (rect[0] + rect[2] - x + 1) // 2 * 2)
+    h = min(height - y, (rect[1] + rect[3] - y + 1) // 2 * 2)
+    return x, y, w, h
+
+
+def old_covers(plan_video: dict | None, captions: dict | None, outset: int) -> list[tuple[float, float, Rect]]:
+    """When and where remove_captions.py covered a Chinese caption, in this video's time."""
     if not plan_video or not captions:
         return []
     clips = captions.get("clips", {})
-    boxes = []
+    covers = []
     for scene in plan_video.get("scenes", []):
         info = clips.get(scene.get("source_file", ""))
-        if info and info.get("caption") and info.get("box"):
-            boxes.append(info["box"])
-    return boxes
+        if not (info and info.get("caption") and info.get("box")):
+            continue
+        b = info["box"]
+        start = float(scene["out_start"]) + float(info.get("start", 0))
+        end = min(float(scene["out_end"]), float(scene["out_start"]) + float(info.get("end", scene["duration"])))
+        if end > start:
+            covers.append((start, end, (b["x"] - outset, b["y"] - outset, b["w"] + 2 * outset, b["h"] + 2 * outset)))
+    return covers
+
+
+def plan_panels(items: list[tuple[float, float, Rect]], duration: float, width: int,
+                height: int) -> list[tuple[Rect, list[tuple[float, float]]]]:
+    """ONE glass panel for the whole video, shown from the first to the last frame.
+
+    Its size never changes: the widest and the tallest of everything it must hold or hide
+    (every Vietnamese line with padding, every Chinese caption cover), centred on the frame.
+    Between two lines only the text disappears; the glass stays.
+    """
+    if not items:
+        return []
+    size = None
+    for _, _, r in items:
+        size = union(size, r)
+    half = max(width / 2 - size[0], size[0] + size[2] - width / 2)
+    fixed = (int(width / 2 - half), size[1], int(2 * half), size[3])
+    return [(even(fixed, width, height), [(0.0, round(duration, 3))])]
 
 
 def panel_mask(path: Path, w: int, h: int) -> None:
@@ -157,48 +204,56 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
             widths = [measure_text(p, font)[0] for p in files]
         reference = work / "ref.txt"
         reference.write_text("ẮẾỸÁgjpqy", encoding="utf-8")
-
-        # Panel: centred horizontally, fits the longest line and every old caption panel of
-        # these scenes. Vertically it only grows where an old panel sticks out.
-        line_y = (captions or {}).get("caption_line", {}).get("center_y", DEFAULT_LINE_Y) * height
-        old = caption_boxes(video, plan_video, captions)
-        half_w = max(widths) / 2 + PAD_X * font
-        for box in old:
-            half_w = max(half_w, width / 2 - box["x"], box["x"] + box["w"] - width / 2)
-        half_w = min(half_w + 2, width / 2 - 2)
-
-        # A panel made wide by old panels leaves room: grow the font (up to MAX_FONT_SIZE) to use it.
-        room = 2 * half_w - 2 * PAD_X * font
-        if max(widths) < room:
-            grown = min(int(font * room / max(widths)), int(MAX_FONT_SIZE * height))
-            if grown > font:
-                font = grown
-                widths = [measure_text(p, font)[0] for p in files]
         _, top, bottom = measure_text(reference, font)
-
         text_h = bottom - top
-        y0 = line_y - text_h / 2 - PAD_Y * font
-        y1 = line_y + text_h / 2 + PAD_Y * font
-        for box in old:
-            y0, y1 = min(y0, box["y"]), max(y1, box["y"] + box["h"])
-        px, pw = int(width / 2 - half_w) // 2 * 2, int(2 * half_w) // 2 * 2
-        py, ph = int(y0 - 2) // 2 * 2, int(y1 - y0 + 4) // 2 * 2
-        line_y = py + ph / 2  # the text sits in the middle of the panel
-        mask = work / f"v{index}_mask.png"
-        panel_mask(mask, pw, ph)
-        inputs += ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(mask)]
+
+        # What must be covered, and when:
+        #   - each Vietnamese line: a panel around that line only, while it is spoken;
+        #   - each Chinese caption cover left by remove_captions.py: its own box, while it is there.
+        # At every moment the panel is the union, i.e. the bigger of the two; nothing -> no panel.
+        line_y = (captions or {}).get("caption_line", {}).get("center_y", DEFAULT_LINE_Y) * height
+        items = []
+        for seg, text_w in zip(segments, widths):
+            w = text_w + 2 * PAD_X * font
+            h = text_h + 2 * PAD_Y * font
+            items.append((float(seg["start"]), float(seg["end"]),
+                          (int(width / 2 - w / 2), int(line_y - h / 2), int(w), int(h))))
+        items += old_covers(plan_video, captions, int(OLD_COVER_OUTSET * height))
+        panels = plan_panels(items, duration, width, height)
+
         tint = TINTS[args.tint]
+        if panels:
+            labels = "".join(f"[cut{k}]" for k in range(len(panels)))
+            filters.append(f"[0:v]split={len(panels) + 1}[base]{labels}")
+        chain = "[base]" if panels else "[0:v]"
+        first_mask_input = 2
+        for k, ((px, py, pw, ph), spans) in enumerate(panels):
+            mask = work / f"v{index}_mask{k}.png"
+            panel_mask(mask, pw, ph)
+            inputs += ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(mask)]
+            # Desaturated glass: the colour of a removed caption (e.g. yellow) does not show through.
+            filters.append(f"[cut{k}]crop={pw}:{ph}:{px}:{py},gblur=sigma={BLUR_SIGMA * height:.1f},"
+                           f"hue=s={GLASS_SATURATION},"
+                           f"colorchannelmixer=rr={tint}:gg={tint}:bb={tint},format=rgba[glass{k}]")
+            filters.append(f"[{first_mask_input + k}:v]format=gray,scale={pw}:{ph}[mask{k}]")
+            filters.append(f"[glass{k}][mask{k}]alphamerge[panel{k}]")
+            enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in spans)
+            out = f"[step{k}]"
+            filters.append(f"{chain}[panel{k}]overlay=x={px}:y={py}:shortest=1:enable='{enable}'{out}")
+            chain = out
+        if panels:
+            filters[-1] = filters[-1][: -len(chain)] + "[panelled]"
+            chain = "[panelled]"
+        chain += "null"
 
-        # Glass: crop, blur, tint, round, overlay.
-        filters.append(f"[0:v]split[base][cut]")
-        filters.append(f"[cut]crop={pw}:{ph}:{px}:{py},gblur=sigma={BLUR_SIGMA * height:.1f},"
-                       f"colorchannelmixer=rr={tint}:gg={tint}:bb={tint},format=rgba[glass]")
-        filters.append(f"[2:v]format=gray,scale={pw}:{ph}[mask]")
-        filters.append(f"[glass][mask]alphamerge[panel]")
-        chain = "[base][panel]overlay=x={px}:y={py}:shortest=1".format(px=px, py=py)
-
-        # Text: one drawtext per line, vertically centred on the panel.
-        text_y = int(line_y - (top + bottom) / 2)
+        # Text: one drawtext per line, centred in the panel. The optical centre of a line is
+        # the body of the letters (cap height: top of "H" to the baseline); accents above and
+        # descenders below are left out, otherwise every line sits visibly too low.
+        centre = panels[0][0][1] + panels[0][0][3] / 2 if panels else line_y
+        cap_file = work / "cap.txt"
+        cap_file.write_text("H", encoding="utf-8")
+        _, cap_top, cap_bottom = measure_text(cap_file, font)
+        text_y = int(round(centre - (cap_top + cap_bottom) / 2))
         shadow = max(1, int(SHADOW * font))
         for seg, path in zip(segments, files):
             chain += (f",drawtext=fontfile={ffmpeg_path(FONT_FILE)}:textfile={ffmpeg_path(path)}:"
@@ -206,7 +261,8 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
                       f"x=(w-text_w)/2:y={text_y}:y_align=font:"
                       f"enable='between(t,{seg['start']:.3f},{seg['end']:.3f})'")
         filters.append(chain + "[v]")
-        layout = {"font_size": font, "panel": {"x": px, "y": py, "w": pw, "h": ph}, "tint": args.tint}
+        layout = {"font_size": font, "tint": args.tint,
+                  "panels": [{"x": r[0], "y": r[1], "w": r[2], "h": r[3], "times": s} for r, s in panels]}
     else:
         filters.append("[0:v]null[v]")
 

@@ -214,7 +214,11 @@ python -m post_process.gemini_reorder "{{ $json.stdout.trim().replace(/^dir:/, '
 ### 6. remove_captions
 
 Tìm caption nhỏ (dòng chữ cố định của video) bằng OpenCV, không dùng AI, rồi che bằng tấm kính mờ:
-hình chữ nhật bo góc, căn giữa khung hình, chữ bên dưới được xoá trước khi làm mờ.
+hình chữ nhật bo góc, chữ bên dưới được xoá trước khi làm mờ. Tấm che **ôm sát câu chữ** (lề nhỏ), căn giữa theo
+khung hình (caption Douyin luôn căn giữa; nếu một bên bị dính vật sáng thì lấy theo bên gần tâm hơn) và **luôn cách
+mép khung hình ít nhất 3%**. Caption dài gần hết chiều ngang vẫn được nhận. Khi không nhận ra được theo dòng chữ (chữ dính vào
+vật sáng phía sau, hoặc chữ to hơn caption nằm trên dòng caption), bước dự phòng đo chiều cao thật của chữ theo mật độ
+pixel từng hàng quanh dòng caption (chấp nhận chữ cao tới 2,4 lần caption, câu ngắn từ 2 chữ).
 Mọi chữ nằm trên dòng caption đều bị che (kể cả chữ to hơn caption); chữ overlay ở vị trí khác được giữ nguyên.
 
 | | |
@@ -265,14 +269,14 @@ tiếng Việt: năng động, bán hàng, xưng "mình" - gọi người xem "b
 
 | | |
 |---|---|
-| Lệnh | `python -m post_process.gemini_voiceover <reorder_json> <proxy_dir> [--output FILE] [--video N ...] [--rate 3.9] [--dry-run]` |
+| Lệnh | `python -m post_process.gemini_voiceover <reorder_json> <proxy_dir> [--output FILE] [--video N ...] [--rate 4.4] [--dry-run]` |
 | Input | `reorder_json`: `.../reorder.json`; `proxy_dir`: `.../proxy` (tìm file `*video_<N>.mp4`) |
 | Môi trường | `GEMINI_API_KEY`, `GEMINI_MODEL` |
 | Output | `voiceover.json`, `gem_voiceover_response.json` (cạnh `reorder.json`, hoặc cạnh `--output`) |
 | stdout | `json:<voiceover.json>` / `fail` (`--dry-run`: ghi `voiceover_request.json`, không gọi Gemini) |
 
-Kiểm tra (sai thì gửi lại cho Gemini, tối đa 3 lần): tổng âm tiết của phần đọc nằm trong 70-100% của
-`thời lượng × --rate` (mục tiêu 88%); mỗi câu phụ đề tối đa 36 ký tự; có `tts_style`.
+Kiểm tra (sai thì gửi lại cho Gemini, tối đa 3 lần): lời thoại phải **phủ kín video**: tổng âm tiết của phần đọc nằm
+trong 85-108% của `thời lượng × --rate` (mục tiêu 95%; `--rate` mặc định 4,4 âm tiết/giây, tốc độ đọc 1 request); mỗi câu phụ đề tối đa 36 ký tự; có `tts_style`.
 `--video 2 3`: chỉ viết lại các video đó, giữ nguyên các video khác trong `voiceover.json`.
 
 `voiceover.json`:
@@ -298,32 +302,52 @@ python -m post_process.gemini_voiceover "{{ $json.stdout.match(/^proxy:(.*)$/m)[
 
 ### 9. gemini_tts
 
-Đọc lời thoại bằng Gemini TTS (`gemini-3.8-flash-tts`, giọng mặc định **Puck**). Gemini TTS không trả timestamp,
-nên **mỗi câu được đọc riêng** (cùng giọng, cùng `tts_style` của video): độ dài file âm thanh của câu chính là thời lượng
-của câu. Script cắt khoảng lặng hai đầu mỗi câu, ghép lại (0,15s đầu + 0,12s giữa các câu) và tính `start`/`end`.
+**Xoay vòng giọng:** mỗi video một giọng khác nhau, bốc ngẫu nhiên từ `GEMINI_TTS_VOICES` (mặc định Puck, Laomedeia,
+Sadachbia, Fenrir, Zephyr); giọng đã dùng trong vòng thì bỏ ra, hết danh sách mới sang vòng mới. Giọng được gán trước khi
+gọi API nên video phải chuyển sang 3.1 vẫn giữ đúng giọng (hai model cùng tên giọng); chạy lại một phần (`--video`) thì
+giọng của các video giữ lại được tính là đã dùng. `--voice X` = một giọng cho mọi video.
+
+Đọc lời thoại bằng Gemini TTS, **giọng miền Nam** (câu cố định thêm vào phong cách đọc,
+đổi bằng `--accent`). **Mỗi video chỉ 1 request**: mọi câu được đọc liền một lần (ngữ điệu liền mạch).
+Gemini TTS không trả timestamp, nên script tìm ranh giới câu: các khoảng lặng dài nhất nằm gần vị trí dự kiến
+(dự kiến theo số âm tiết). Nếu kết quả không hợp lý (câu quá ngắn, tốc độ bất thường) thì chia theo số âm tiết;
+cách đã dùng ghi ở `split` (`silence` / `proportional` / `single`). Sau đó cắt khoảng lặng hai đầu, giọng bắt đầu sau 0,15s.
+
+**Model và dự phòng:** `gemini-3.8-flash-tts` trước; khi nó báo **hết hạn mức ngày** thì chuyển **ngay** sang
+`gemini-3.1-flash-tts-preview` cho video đó và các video sau. Cả hai đều hết thì dừng: `E_QUOTA_DAILY` (kèm
+`retry_after` ngắn nhất), giữ các video đã xong, dòng cuối stderr ghi các video cần chạy lại (`--video ...`).
+3.8 nhận phong cách qua trường riêng và thẻ `<short pause>` giữa các câu; 3.1 nhận phong cách viết trước văn bản,
+các câu xuống dòng, và trả âm thanh PCM thô (script tự xử lý). `tts.json` ghi model đã dùng cho từng video.
 
 | | |
 |---|---|
-| Lệnh | `python -m post_process.gemini_tts <voiceover_json> <output_dir> [--voice Puck] [--model M] [--video N ...] [--gap 0.12] [--lead 0.15] [--max-speedup 1.15]` |
+| Lệnh | `python -m post_process.gemini_tts <voiceover_json> <output_dir> [--voice Puck] [--model M] [--fallback-model M] [--accent TEXT] [--video N ...] [--lead 0.15] [--max-speedup 1.15]` |
 | Input | `voiceover_json`: `.../voiceover.json`; `output_dir`: `.../voice` |
-| Môi trường | `GEMINI_API_KEY`; `GEMINI_TTS_MODEL` (mặc định `gemini-3.8-flash-tts`); `GEMINI_TTS_RPM` (mặc định 10) |
+| Môi trường | `GEMINI_API_KEY`; `GEMINI_TTS_MODEL` (mặc định `gemini-3.8-flash-tts`); `GEMINI_TTS_FALLBACK_MODEL` (mặc định `gemini-3.1-flash-tts-preview`, để trống = không dự phòng); `GEMINI_TTS_RPM` (mỗi model, mặc định 10); `GEMINI_TTS_VOICES` (danh sách giọng xoay vòng); `GEMINI_TTS_ACCENT` (câu yêu cầu giọng vùng miền, để trống = không) — tất cả trong `.env`, tham số dòng lệnh được ưu tiên hơn |
 | Output | `<output_dir>/voice_video_<N>.wav` (24 kHz mono, bắt đầu từ giây 0 của video); `tts.json` cạnh `voiceover.json` |
 | stdout | `json:<tts.json>` / `fail` (video nào lỗi thì bỏ, các video còn lại vẫn được ghi) |
-| Thời gian | khoảng 2,5 phút cho 4 video (bị giới hạn 10 request/phút của gói Tier 1) |
+| Thời gian | khoảng 7-10 giây mỗi video |
 
+**Không để khoảng lặng ở cuối:** giọng đọc ngắn hơn video thì nới các khoảng nghỉ giữa các câu (tối đa +0,35s mỗi chỗ,
+chỉ khi tách câu bằng khoảng lặng), rồi đọc chậm lại một chút (không chậm hơn 0,92x), để giọng kết thúc khoảng 0,25s
+trước khi hết video (`added_pause`, `speed` trong `tts.json`).
 Khớp độ dài: giọng đọc dài hơn video (trừ 0,1s cuối) thì tăng tốc giữ nguyên cao độ (`atempo`), tối đa `--max-speedup`
-(1,15x); vẫn dài quá thì video đó `fail`, stderr gợi ý chạy lại `gemini_voiceover --video N --rate <tốc độ đo được>`.
-Request được giãn cách theo `GEMINI_TTS_RPM`; gặp 429 theo phút thì chờ đúng thời gian server yêu cầu.
-**Hạn mức theo ngày** (Tier 1: 100 request/ngày cho `gemini-3.8-flash-tts`; mỗi câu thoại là 1 request, khoảng 6-8
-request mỗi video) khi hết thì dừng ngay: báo `E_QUOTA_DAILY` kèm `retry_after`, giữ các video đã xong trong `tts.json`,
-và dòng cuối stderr ghi các video cần chạy lại (`--video ...`).
+(1,15x); vẫn dài quá thì `E_TOO_LONG`, stderr gợi ý chạy lại `gemini_voiceover --video N --rate <tốc độ đo được>`.
+Tốc độ toàn bài bất thường (đọc sót/lặp chữ) thì hỏi lại 1 lần, vẫn sai thì `E_NO_OUTPUT`.
+Request giãn cách theo `GEMINI_TTS_RPM`; 429 theo phút và lỗi 400 "audio stream could not be completed ... retry"
+thì chờ rồi thử lại. Hạn mức Tier 1: 100 request/ngày mỗi model, tức khoảng 100 video/ngày với 3.8 (+ dự phòng 3.1);
+đặt lại lúc 0 giờ giờ Thái Bình Dương (15:00 giờ Việt Nam).
 
 `tts.json`:
 ```
 {
-  "model", "voice", "sample_rate", "audio_dir",
+  "model", "fallback_model", "voices", "accent", "sample_rate", "audio_dir",
   "videos": [{
-    "video_index", "audio_file", "video_duration", "speech_duration",
+    "video_index",
+    "voice",            giọng đã gán cho video này (xoay vòng)
+    "model",            model đã thật sự dùng cho video này
+    "split",            silence | proportional | single: cách tìm ranh giới câu
+    "audio_file", "video_duration", "speech_duration",
     "speed",            hệ số tăng tốc đã áp dụng (1.0 = không)
     "measured_rate",    âm tiết/giây đo được
     "segments": [{"index", "text", "spoken", "start", "end"}]    giây, theo thời gian video
@@ -340,11 +364,15 @@ python -m post_process.gemini_tts "{{ $json.stdout.trim().replace(/^json:/, '') 
 
 Ghép giọng đọc và phụ đề tiếng Việt vào video cuối (bước 7). Âm thanh gốc bị bỏ (mặc định).
 Phụ đề: chữ trắng đậm (Noto Sans Bold) có bóng, hiện đúng `start`-`end` của từng câu trong `tts.json`,
-đặt giữa **một tấm kính mờ cố định cho cả video**: hình chữ nhật bo góc, căn giữa khung hình, trên dòng caption.
-Tấm kính đủ rộng cho câu dài nhất và phủ hết các tấm kính cũ của `remove_captions` trong các cảnh của video
-(lấy từ `captions.json` + `reorder.json`), nên không đổi kích thước ở chỗ nối cảnh và không lộ mép tấm kính cũ.
-Độ rộng chữ được đo bằng chính font; câu quá dài thì thu nhỏ chữ (không dưới 1,8% chiều cao), tấm kính rộng thì
-phóng chữ lên (tối đa 3,2%).
+đặt giữa một tấm kính mờ (hình chữ nhật bo góc, căn giữa khung hình, trên dòng caption).
+- **Kích thước cố định cho cả video** (không phóng to thu nhỏ): chiều dài lớn nhất và chiều cao lớn nhất trong số
+  nền của các câu tiếng Việt và các vùng che chữ Trung của `remove_captions` trong các cảnh của video
+  (lấy từ `captions.json` + `reorder.json`), nên không lộ mép tấm che cũ.
+- **Hiện suốt video**, từ khung đầu đến khung cuối; giữa hai câu chỉ ẩn chữ, tấm kính vẫn còn.
+- Kính được giảm độ bão hoà màu (40%) để màu của caption đã xoá (ví dụ chữ vàng) không ánh qua.
+- **Chữ nằm giữa tấm kính theo chiều dọc**, căn theo thân chữ (chiều cao chữ hoa), không tính dấu phía trên và đuôi
+  chữ phía dưới, nên nhìn cân.
+- Độ rộng chữ được đo bằng chính font; câu quá dài (hơn 90% chiều ngang) thì thu nhỏ chữ, không dưới 1,8% chiều cao.
 
 | | |
 |---|---|
@@ -366,7 +394,7 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
 
 | Ở đâu | Gì |
 |---|---|
-| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (đọc bởi bước 5, 8) |
+| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
 | `Dockerfile` | Alpine 3.24 (`apk`), ffmpeg, font Noto, Python 3.14, OpenCV/numpy từ `apk`, `uv`, `post_process` copy vào `/opt/post_process` |
 | `docker-compose.yml` | `./media` -> `/data/media`, `./n8n_data` -> `/home/node/.n8n` |
 | Hằng số đầu mỗi script | ngưỡng quy tắc (thời lượng video, số lần dùng cảnh, kích thước caption, tốc độ đọc…) |
@@ -377,7 +405,7 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
 |---|---|---|
 | 5. gemini_reorder | 1 (+ tối đa 2 lần sửa) | khoảng 39.000 (video 22.000, suy nghĩ 12.000) |
 | 8. gemini_voiceover | 1 mỗi video (3-4 video) | khoảng 8.000-9.000 |
-| 9. gemini_tts | 1 mỗi câu (5-7 câu mỗi video) | không đo; giới hạn 10 request/phút (Tier 1) |
+| 9. gemini_tts | 1 mỗi video | khoảng 300-350 (chữ ~80 + âm thanh ~250); giới hạn 100 request/ngày mỗi model (Tier 1) |
 
 ## Hạn chế đã biết
 
@@ -385,7 +413,8 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
   dòng caption không bị che (cố ý).
 - `gemini_voiceover`: tên thương hiệu có thể được đọc không nhất quán (ví dụ "iKF"). Tốc độ đọc mặc định 3,9 âm tiết/giây
   đo với giọng Puck; thực tế dao động 3,4-4,7 tuỳ câu, nên `gemini_tts` có bước tăng tốc nhẹ để khớp.
-- `gemini_tts`: mỗi câu đọc riêng nên ngữ điệu giữa các câu có thể không liền mạch hoàn toàn.
+- `gemini_tts`: ranh giới câu được đoán từ khoảng lặng (hoặc chia theo âm tiết khi không đoán được), nên phụ đề có thể
+  lệch vài phần mười giây; bản dự phòng 3.1 là model preview, giọng có thể khác 3.8 dù cùng tên giọng.
 - `render_videos`: bản ở `output/` vẫn còn âm thanh gốc (lời tiếng Trung); bản hoàn chỉnh ở `output/final/` thì không.
-- `compose_videos`: tấm kính phải phủ các tấm kính cũ nên có thể rộng hơn nhiều so với câu ngắn;
+- `compose_videos`: tấm kính cố định theo câu/vùng che lớn nhất của video nên câu ngắn có thể có nhiều khoảng trống;
   chữ overlay lớn của video gốc (không nằm trên dòng caption) vẫn còn và có thể nằm sát tấm kính.

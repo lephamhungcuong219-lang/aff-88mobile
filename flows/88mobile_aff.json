@@ -1,0 +1,307 @@
+{
+  "name": "88mobile_aff",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -496,
+        -80
+      ],
+      "id": "018ebd12-f608-4775-8ef4-13f54c255259",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "command": "=uv run python -m post_process.make_dir \"/data/media/jobs/{{ $workflow.id }}-{{ $execution.id }}\" "
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -224,
+        -288
+      ],
+      "id": "d537ae72-95d7-4fdb-b7ba-1d9310c809d6",
+      "name": "Tạo thư mục lưu trữ"
+    },
+    {
+      "parameters": {
+        "operation": "Run actor and get dataset",
+        "actorId": {
+          "__rl": true,
+          "value": "NaJlT9yHmCzCyHHuC",
+          "mode": "list",
+          "cachedResultName": "Douyin Video Downloader & Scraper - No Watermark (hgservices/douyin-scraper)",
+          "cachedResultUrl": "https://console.apify.com/actors/NaJlT9yHmCzCyHHuC/input"
+        },
+        "customBody": "{\n  \"startUrls\": [\n    \"https://v.douyin.com/_rVkKHDtGKo/\"\n  ]\n}",
+        "timeout": {},
+        "memory": 4096,
+        "maxTotalChargeUsd": {}
+      },
+      "type": "@apify/n8n-nodes-apify.apify",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        -80
+      ],
+      "id": "f6aa8941-5bbb-4eb1-a663-f4655b0cba68",
+      "name": "Lấy thông tin video",
+      "credentials": {
+        "apifyApi": {
+          "id": "xivCK5nBYkpLUWU9",
+          "name": "lephamhungcuong219@gmail.com"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "command": "=python -m post_process.download_media \"{{ $json.awemeId }}\" \"{{ $json.videoUrlNoWatermark }}\" \"{{ $json.musicUrl }}\" /data/media/jobs/{{ $workflow.id }}-{{ $execution.id }}/input"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        16,
+        -80
+      ],
+      "id": "bb01c37e-d7d2-43bc-aa28-65f6953cffbb",
+      "name": "Tải video"
+    },
+    {
+      "parameters": {
+        "command": "=uv run python -m post_process.split_video {{ $json.stdout.replace(/^mp4:/, '') }} {{ (p => p.split('/').slice(0, -2).join('/') + '/temp/' + p.split('/').pop().replace(/\\.mp4$/, '') + '/sources')($json.stdout.trim().replace(/^mp4:/, '')) }}"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        256,
+        -80
+      ],
+      "id": "c2c5ff13-c044-48a8-b0e0-ed6cdf61ccd0",
+      "name": "Cắt cảnh trong video"
+    },
+    {
+      "parameters": {
+        "command": "=uv run python -m post_process.compress_clips \"{{ $json.stdout.trim().replace(/^dir:/, '') }}\" \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/sources$/, '/compressed') }}\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        496,
+        -80
+      ],
+      "id": "12fe62bf-75fe-4668-a4f4-e7d5403349dc",
+      "name": "Nén cảnh và chuẩn bị thông tin"
+    },
+    {
+      "parameters": {
+        "command": "=python -m post_process.gemini_reorder \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/compressed$/, '/scenelog.json') }}\" \"{{ $json.stdout.trim().replace(/^dir:/, '') }}\" \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/compressed$/, '/reorder.json') }}\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        752,
+        -80
+      ],
+      "id": "e0699f51-30be-431e-8df8-1fdc27ee14cf",
+      "name": "Nấu các cảnh"
+    },
+    {
+      "parameters": {
+        "command": "=python -m post_process.remove_captions \"{{ $json.stdout.trim().replace(/^json:/, '').replace(/\\/reorder\\.json$/, '/sources') }}\" \"{{ $json.stdout.trim().replace(/^json:/, '').replace(/\\/reorder\\.json$/, '/clean') }}\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1024,
+        -80
+      ],
+      "id": "828938ec-9223-4ba9-b927-ebd14a05dc9e",
+      "name": "Làm mờ caption của clips"
+    },
+    {
+      "parameters": {
+        "command": "=python -m post_process.render_videos \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/reorder.json\" \"{{ $json.stdout.trim().replace(/^dir:/, '') }}\" \"{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(0, -3).join('/') }}/output\" --proxy-dir \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/proxy\" --proxy-clips \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/clean$/, '') }}/sources\" --prefix \"{{ $json.stdout.trim().replace(/^dir:/, '').split('/').slice(-2, -1)[0] }}_\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1296,
+        -80
+      ],
+      "id": "e93997ec-fd5e-467c-9b70-78c35c8aa58f",
+      "name": "Ghép các clips đã nấu thành video"
+    },
+    {
+      "parameters": {
+        "command": "=uv run python -m post_process.gemini_voiceover \"{{ $json.stdout.match(/^proxy:(.*)$/m)[1].replace(/\\/proxy$/, '') }}/reorder.json\" \"{{ $json.stdout.match(/^proxy:(.*)$/m)[1] }}\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1568,
+        -80
+      ],
+      "id": "be512c3a-66d0-4876-aa4d-28778f4d4bf5",
+      "name": "Chuẩn bị nội dung thoại"
+    },
+    {
+      "parameters": {
+        "command": "=python -m post_process.gemini_tts \"{{ $json.stdout.trim().replace(/^json:/, '') }}\" \"{{ $json.stdout.trim().replace(/^json:/, '').replace(/\\/voiceover\\.json$/, '/voice') }}\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1824,
+        -80
+      ],
+      "id": "cba54076-55c4-4797-8955-89fffbf1a126",
+      "name": "Tạo thoại đè"
+    },
+    {
+      "parameters": {
+        "command": "=python -m post_process.compose_videos \"{{ $json.stdout.trim().replace(/^json:/, '') }}\" \"{{ $json.stdout.trim().replace(/^json:/, '').split('/').slice(0, -3).join('/') }}/output\" \"{{ $json.stdout.trim().replace(/^json:/, '').split('/').slice(0, -3).join('/') }}/output/final\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2096,
+        -80
+      ],
+      "id": "3283078e-0741-4851-a6c2-c6df31018fce",
+      "name": "Ghép thoại vào video và hoàn tất quá trình"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Lấy thông tin video",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Tạo thư mục lưu trữ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lấy thông tin video": {
+      "main": [
+        [
+          {
+            "node": "Tải video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tải video": {
+      "main": [
+        [
+          {
+            "node": "Cắt cảnh trong video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cắt cảnh trong video": {
+      "main": [
+        [
+          {
+            "node": "Nén cảnh và chuẩn bị thông tin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nén cảnh và chuẩn bị thông tin": {
+      "main": [
+        [
+          {
+            "node": "Nấu các cảnh",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nấu các cảnh": {
+      "main": [
+        [
+          {
+            "node": "Làm mờ caption của clips",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Làm mờ caption của clips": {
+      "main": [
+        [
+          {
+            "node": "Ghép các clips đã nấu thành video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ghép các clips đã nấu thành video": {
+      "main": [
+        [
+          {
+            "node": "Chuẩn bị nội dung thoại",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chuẩn bị nội dung thoại": {
+      "main": [
+        [
+          {
+            "node": "Tạo thoại đè",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tạo thoại đè": {
+      "main": [
+        [
+          {
+            "node": "Ghép thoại vào video và hoàn tất quá trình",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "b049eb2a-ff4b-48fe-a6c1-ec3ee11f0360",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e82d21276fd2c15d8c7594a7dcd1d0ea17f6e5e6c833f1173f5d5a67c49c0209"
+  },
+  "nodeGroups": [],
+  "id": "DFWxtX6yNHTW20wS",
+  "tags": []
+}

@@ -56,10 +56,11 @@ except ImportError:  # python post_process/gemini_voiceover.py
     from gemini_reorder import (DEFAULT_MODEL, KEY_PLACEHOLDER, MAX_INLINE_BYTES,
                                 ReorderError, call_gemini, extract_answer, write_json)
 
-DEFAULT_RATE = 3.9        # Vietnamese syllables per second, measured with Gemini TTS voice "Puck"
-                          # (Fenrir ~4.4, Laomedeia/Sadachbia/Zephyr ~3.75); change with --rate
-TARGET_FILL = 0.88        # aim for this share of the video filled with speech (room to breathe)
-MIN_FILL, MAX_FILL = 0.70, 1.00
+DEFAULT_RATE = 4.4        # Vietnamese syllables per second when gemini_tts reads a whole video in one
+                          # request: ~3.8 (Zephyr, Laomedeia) to ~4.5 (Puck); gemini_tts speeds up
+                          # a slow voice (max 1.15x) and stretches a fast one, so the middle is safest
+TARGET_FILL = 0.95        # the voice must fill the video from start to end (no silent ending)
+MIN_FILL, MAX_FILL = 0.85, 1.08  # gemini_tts stretches pauses / speeds up slightly to fit exactly
 MAX_SEGMENT_CHARS = 36    # one subtitle line
 CLIP_FPS = 4              # proxy frames per second Gemini looks at
 ANSWER_ATTEMPTS = 3
@@ -89,7 +90,8 @@ kết thúc bằng một câu kêu gọi ngắn (ví dụ rủ bạn bấm vào 
 Lời thoại nên đi cùng nhịp với hình: nói về chi tiết nào thì cố gắng rơi vào lúc cảnh đó đang chiếu.
 
 QUY TẮC BẮT BUỘC (sẽ được kiểm tra tự động):
-- Độ dài: phần "spoken" của tất cả các đoạn cộng lại khoảng {target} âm tiết
+- Độ dài: lời thoại phải phủ kín video từ đầu đến cuối, không để khoảng lặng ở cuối.
+  Phần "spoken" của tất cả các đoạn cộng lại khoảng {target} âm tiết
   (tối thiểu {min_syl}, tối đa {max_syl}); mỗi chữ cách nhau bởi dấu cách là một âm tiết.
 - Chia lời thoại thành các đoạn ngắn để làm phụ đề: mỗi "text" tối đa {max_chars} ký tự,
   ngắt ở chỗ ngắt hơi tự nhiên, không cắt giữa một cụm từ.
