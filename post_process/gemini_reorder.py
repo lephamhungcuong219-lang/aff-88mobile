@@ -23,6 +23,8 @@ All timestamps are computed from scenelog.json, never taken from Gemini.
 Environment:
     GEMINI_API_KEY   required (put it in .env)
     GEMINI_MODEL     optional, default below
+    REORDER_TARGET_VIDEOS  optional: make exactly this many videos (see video_policy);
+                     empty = Gemini decides (at least enough to use every scene)
 
 Files (next to <output_json>):
     request.json        the request body sent to Gemini (first call; retries
@@ -102,7 +104,7 @@ NHIỆM VỤ: từ các scene này, lên kế hoạch cho NHIỀU video ngắn m
 - Nếu một khía cạnh không đủ cảnh để làm thành một video đủ thời lượng, được phép kết hợp nhiều khía cạnh
   vào cùng một video (khi đó ghi rõ các khía cạnh trong "angle"). Điều quan trọng nhất là thời lượng
   của từng video đúng quy tắc bên dưới.
-- Số lượng video do bạn quyết định theo nội dung, tối thiểu {min_videos} video.
+{count_rule}
 - Mỗi video nên có cấu trúc riêng phù hợp với góc của nó: hook mạnh ở 1-2 giây đầu, phần chính, kết
   (cảnh sản phẩm tổng thể / kêu gọi hành động). Các video phải khác nhau rõ rệt về cảnh mở đầu và thứ tự,
   để người xem không nhận ra chúng được dựng từ cùng một video.
@@ -111,7 +113,7 @@ QUY TẮC BẮT BUỘC (sẽ được kiểm tra tự động):
 - Thời lượng mỗi video (tổng thời lượng các scene của nó) khoảng {target:.0f} giây,
   KHÔNG dưới {min_s:.0f} giây và KHÔNG quá {max_s:.0f} giây. Hãy cộng thời lượng ở bảng trên cẩn thận.
 - Trong một video, mỗi scene xuất hiện tối đa một lần.
-- MỌI scene từ 1 đến {count} phải được dùng trong ít nhất một video.
+{coverage_rule}
 - Một scene được dùng trong tối đa {max_uses} video.
 - Hai video bất kỳ dùng chung không quá {shared_pct}% số scene của video ngắn hơn.
 - Chỉ trả về scene_number theo thứ tự trong từng video. KHÔNG tự tính timestamp.
@@ -128,8 +130,8 @@ Kế hoạch vừa rồi vi phạm quy tắc:
 Hãy sửa lại và trả về TOÀN BỘ kế hoạch theo đúng schema, giữ các góc tiếp cận còn hợp lệ.
 Nếu một video quá ngắn vì góc của nó thiếu cảnh, hãy kết hợp thêm khía cạnh khác vào video đó
 hoặc gộp nó với video khác.
-Nhắc lại: mỗi video {min_s:.0f}-{max_s:.0f} giây (mục tiêu {target:.0f} giây), mọi scene 1-{count} được dùng
-ít nhất một lần, mỗi scene tối đa {max_uses} video, không lặp scene trong cùng một video.
+Nhắc lại: mỗi video {min_s:.0f}-{max_s:.0f} giây (mục tiêu {target:.0f} giây), {count_fix}{coverage_fix}
+mỗi scene tối đa {max_uses} video, không lặp scene trong cùng một video.
 """
 
 SCENE_ITEM = {
@@ -185,6 +187,20 @@ def log(message: str) -> None:
     print(f"[gemini_reorder] {message}", file=sys.stderr)
 
 
+def target_videos() -> int | None:
+    """REORDER_TARGET_VIDEOS from the environment (.env): number of videos to make, or None."""
+    raw = os.environ.get("REORDER_TARGET_VIDEOS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ReorderError(f"REORDER_TARGET_VIDEOS must be a whole number: {raw!r}") from exc
+    if value < 1:
+        raise ReorderError(f"REORDER_TARGET_VIDEOS must be at least 1: {value}")
+    return value
+
+
 def log_error(error: Exception, script: str = "gemini_reorder") -> None:
     print(format_error(script, error), file=sys.stderr)
 
@@ -192,6 +208,35 @@ def log_error(error: Exception, script: str = "gemini_reorder") -> None:
 def min_videos(scenes: list[dict]) -> int:
     """Fewest videos that can cover every scene within MAX_VIDEO_S each."""
     return max(1, math.ceil(sum(s["duration"] for s in scenes) / MAX_VIDEO_S))
+
+
+def video_policy(scenes: list[dict], target: int | None) -> dict:
+    """How many videos to make, and whether every scene must be used.
+
+    target None: Gemini decides (at least min_videos), every scene used.
+    target N: exactly N videos. N is lowered when the source is too short for N videos of
+    MIN_VIDEO_S (each scene may be reused MAX_SCENE_USES times). When N videos of at most
+    MAX_VIDEO_S cannot hold every scene (long source), N is kept and the "every scene"
+    rule is dropped: Gemini picks the best scenes.
+    """
+    total = sum(s["duration"] for s in scenes)
+    needed = min_videos(scenes)
+    if target is None:
+        return {"target": None, "count": None, "cover_all": True, "notes": [],
+                "count_rule": f"- Số lượng video do bạn quyết định theo nội dung, tối thiểu {needed} video.",
+                "count_fix": ""}
+    notes, count = [], target
+    possible = max(1, int(MAX_SCENE_USES * total // MIN_VIDEO_S))
+    if count > possible:
+        notes.append(f"{target} videos need more footage than {total:.1f}s; making {possible}")
+        count = possible
+    cover_all = count >= needed
+    if not cover_all:
+        notes.append(f"{count} videos of at most {MAX_VIDEO_S:.0f}s cannot use all {total:.1f}s: "
+                     "the best scenes are picked, not every scene")
+    return {"target": target, "count": count, "cover_all": cover_all, "notes": notes,
+            "count_rule": f"- Tạo ĐÚNG {count} video (không hơn, không kém).",
+            "count_fix": f"đúng {count} video, "}
 
 
 def load_scenes(scenelog: Path) -> list[dict]:
@@ -226,9 +271,21 @@ def load_scenes(scenelog: Path) -> list[dict]:
     return scenes
 
 
-def rule_values(scenes: list[dict]) -> dict:
+def rule_values(scenes: list[dict], policy: dict) -> dict:
+    n = len(scenes)
+    if policy["cover_all"]:
+        coverage_rule = f"- MỌI scene từ 1 đến {n} phải được dùng trong ít nhất một video."
+        coverage_fix = f"mọi scene 1-{n} được dùng ít nhất một lần, "
+    else:
+        coverage_rule = ("- KHÔNG bắt buộc dùng hết các scene (video gốc dài hơn tổng thời lượng các video): "
+                         "chọn những scene hay nhất cho từng góc tiếp cận.")
+        coverage_fix = ""
     return {
-        "count": len(scenes),
+        "count": n,
+        "count_rule": policy["count_rule"],
+        "count_fix": policy["count_fix"],
+        "coverage_rule": coverage_rule,
+        "coverage_fix": coverage_fix,
         "target": TARGET_VIDEO_S,
         "min_s": MIN_VIDEO_S,
         "max_s": MAX_VIDEO_S,
@@ -237,13 +294,12 @@ def rule_values(scenes: list[dict]) -> dict:
     }
 
 
-def build_request(scenes: list[dict], clips_dir: Path) -> dict:
+def build_request(scenes: list[dict], clips_dir: Path, policy: dict) -> dict:
     durations = "\n".join(f"  Scene {s['scene_number']}: {s['duration']:.3f}" for s in scenes)
     prompt = PROMPT.format(
         durations=durations,
         total=sum(s["duration"] for s in scenes),
-        min_videos=min_videos(scenes),
-        **rule_values(scenes),
+        **rule_values(scenes, policy),
     )
     parts = [{"text": prompt}]
 
@@ -331,7 +387,7 @@ def extract_answer(response: dict) -> tuple[dict, dict]:
     return answer, {"role": "model", "parts": parts}
 
 
-def find_problems(answer: dict, scenes: list[dict]) -> list[str]:
+def find_problems(answer: dict, scenes: list[dict], policy: dict) -> list[str]:
     """Check the plan against the rules; return human-readable problems (empty = valid)."""
     durations = {s["scene_number"]: s["duration"] for s in scenes}
     videos = answer.get("videos")
@@ -339,6 +395,8 @@ def find_problems(answer: dict, scenes: list[dict]) -> list[str]:
         return ["Không có danh sách 'videos'."]
 
     problems, plans = [], []
+    if policy["count"] is not None and len(videos) != policy["count"]:
+        problems.append(f"Có {len(videos)} video, yêu cầu đúng {policy['count']} video.")
     for index, video in enumerate(videos, start=1):
         items = video.get("scenes") if isinstance(video, dict) else None
         if not isinstance(items, list) or not items:
@@ -362,7 +420,7 @@ def find_problems(answer: dict, scenes: list[dict]) -> list[str]:
 
     uses = {n: [i for i, plan in enumerate(plans, start=1) if n in plan] for n in durations}
     unused = [n for n, where in uses.items() if not where]
-    if unused:
+    if unused and policy["cover_all"]:
         problems.append(f"Scene chưa được dùng ở video nào: {unused}.")
     overused = {n: where for n, where in uses.items() if len(where) > MAX_SCENE_USES}
     for n, where in overused.items():
@@ -383,7 +441,7 @@ def find_problems(answer: dict, scenes: list[dict]) -> list[str]:
     return problems
 
 
-def build_output(answer: dict, scenes: list[dict], model: str) -> dict:
+def build_output(answer: dict, scenes: list[dict], model: str, policy: dict) -> dict:
     by_number = {s["scene_number"]: s for s in scenes}
     videos = []
     for index, video in enumerate(answer["videos"], start=1):
@@ -428,6 +486,10 @@ def build_output(answer: dict, scenes: list[dict], model: str) -> dict:
             "min_video_s": MIN_VIDEO_S,
             "max_scene_uses": MAX_SCENE_USES,
             "max_shared_ratio": MAX_SHARED_RATIO,
+            "target_videos": policy["target"],
+            "videos_required": policy["count"],
+            "all_scenes_used_required": policy["cover_all"],
+            "notes": policy["notes"],
         },
         "source_scene_count": len(scenes),
         "source_total_duration": round(sum(s["duration"] for s in scenes), 3),
@@ -443,7 +505,8 @@ def write_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
-def plan_videos(body: dict, scenes: list[dict], model: str, api_key: str, response_file: Path) -> dict:
+def plan_videos(body: dict, scenes: list[dict], model: str, api_key: str, response_file: Path,
+                policy: dict) -> dict:
     """Ask Gemini, feeding rule violations back into the same conversation.
 
     Every attempt (raw response, problems, fix prompt) is saved to response_file.
@@ -475,12 +538,12 @@ def plan_videos(body: dict, scenes: list[dict], model: str, api_key: str, respon
             record({**entry, "problems": problems})
             continue  # nothing usable to correct; ask again from scratch
 
-        problems = find_problems(answer, scenes)
+        problems = find_problems(answer, scenes, policy)
         if not problems:
             record({**entry, "accepted": True, "problems": []})
             return answer
         log("Plan breaks the rules:\n  " + "\n  ".join(problems))
-        fix = FIX_PROMPT.format(problems="\n".join(f"- {p}" for p in problems), **rule_values(scenes))
+        fix = FIX_PROMPT.format(problems="\n".join(f"- {p}" for p in problems), **rule_values(scenes, policy))
         record({**entry, "problems": problems, "fix_prompt": fix})
         body["contents"] = body["contents"][:1] + [model_turn, {"role": "user", "parts": [{"text": fix}]}]
     raise ReorderError(f"No valid plan after {ANSWER_ATTEMPTS} attempts: {'; '.join(problems)}", E_INVALID_ANSWER)
@@ -505,7 +568,10 @@ def main() -> int:
         if output in (request_file, response_file):
             raise ReorderError(f"output_json must not be named {output.name}")
         scenes = load_scenes(scenelog)
-        body = build_request(scenes, clips_dir)
+        policy = video_policy(scenes, target_videos())
+        for note in policy["notes"]:
+            log(f"REORDER_TARGET_VIDEOS: {note}")
+        body = build_request(scenes, clips_dir, policy)
         output.parent.mkdir(parents=True, exist_ok=True)
         write_json(request_file, body)
 
@@ -521,8 +587,8 @@ def main() -> int:
         output.unlink(missing_ok=True)
         response_file.unlink(missing_ok=True)
 
-        answer = plan_videos(body, scenes, model, api_key, response_file)
-        result = build_output(answer, scenes, model)
+        answer = plan_videos(body, scenes, model, api_key, response_file, policy)
+        result = build_output(answer, scenes, model, policy)
         log(", ".join(f"video {v['video_index']}: {v['total_duration']:.1f}s" for v in result["videos"]))
         write_json(output, result)
     except ReorderError as exc:

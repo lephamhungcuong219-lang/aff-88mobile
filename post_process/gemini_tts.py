@@ -18,7 +18,10 @@ intonation flows naturally and the daily request limit goes ~7x further. Per vid
   4. fit the video so there is no silent ending: a track that ends early gets longer
      pauses between lines (at most MAX_EXTRA_PAUSE_S each) and then a slightly slower
      delivery (not below MIN_SPEED); a track longer than the video is sped up (pitch
-     kept, ffmpeg atempo) by at most --max-speedup; still too long -> E_TOO_LONG
+     kept, ffmpeg atempo) by at most --max-speedup. If even that is not enough (a slow
+     voice), the video is read ONCE more by the same voice asked to speak faster
+     (FASTER_STYLE, 1 extra request) and the shorter take is kept; still too long ->
+     E_TOO_LONG
 
 Models: --model (default gemini-3.8-flash-tts), then --fallback-model (default
 gemini-3.1-flash-tts-preview; "" disables it). When a model reports its DAILY
@@ -41,7 +44,7 @@ Environment (set in .env; a command-line option wins over it):
     GEMINI_TTS_FALLBACK_MODEL   default gemini-3.1-flash-tts-preview; empty = no fallback
     GEMINI_TTS_RPM              requests per minute per model, default 10
     GEMINI_TTS_VOICES           voice rotation pool, comma-separated (default Puck,Laomedeia,
-                                Sadachbia,Fenrir,Zephyr). Every video gets a random voice not yet
+                                Sadachbia,Fenrir). Every video gets a random voice not yet
                                 used in the current round; a new round starts when all are used.
                                 The voice is fixed per video, also when falling back to the
                                 other model. --voice X uses X for every video instead.
@@ -89,7 +92,8 @@ DEFAULT_MODEL = "gemini-3.8-flash-tts"
 DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-tts-preview"
 LEGACY_MODEL_PREFIXES = ("gemini-3.1-", "gemini-2.5-")  # style in the text, raw PCM answer
 DEFAULT_VOICE = "Puck"
-DEFAULT_VOICES = "Puck,Laomedeia,Sadachbia,Fenrir,Zephyr"  # rotation pool (names valid for 3.8 and 3.1)
+DEFAULT_VOICES = "Puck,Laomedeia,Sadachbia,Fenrir"  # rotation pool (names valid for 3.8 and 3.1);
+# Zephyr left out: the slowest reader in every test (~3.6 syllables/s), often too long to fit
 DEFAULT_ACCENT = "Use a natural Southern Vietnamese accent (Saigon / Ho Chi Minh City)."
 KEY_PLACEHOLDER = "your-gemini-api-key-here"
 SAMPLE_RATE = 24000
@@ -111,6 +115,8 @@ FILL_END_MARGIN_S = 0.25  # a short voice is stretched to end about this long be
 FILL_TOLERANCE_S = 0.15   # shorter than the target by less than this: left as is
 MAX_EXTRA_PAUSE_S = 0.35  # at most this much silence added to each pause between lines
 MIN_SPEED = 0.92          # never slower than this when stretching (sounds natural)
+FASTER_STYLE = ("Speak noticeably faster than usual, at a brisk energetic pace, "
+                "with only very short pauses between sentences.")  # retry when a voice reads too slowly
 
 TTSError = GeminiError
 
@@ -342,19 +348,32 @@ def render_video(video: dict, out_dir: Path, voice: str, accent: str, api_key: s
     lines = [str(s["spoken"]).strip() for s in segments]
     counts = [syllables(line) for line in lines]
 
-    log(f"Video {index}: synthesising {len(lines)} lines in one request ({voice})")
-    samples, model = voice_track(lines, style, voice, api_key, pool)
-    start, end, bounds, method = split_lines(samples, counts)
+    def take(style_text: str):
+        """Synthesise, split and trim: (track, timings, measured rate, model, split method)."""
+        samples, used_model = voice_track(lines, style_text, voice, api_key, pool)
+        start, end, bounds, split = split_lines(samples, counts)
+        keep = int(KEEP_EDGE_S * SAMPLE_RATE)
+        cut_from = max(0, int(start * SAMPLE_RATE) - keep)
+        cut_to = min(samples.size, int(end * SAMPLE_RATE) + keep)
+        trimmed = np.concatenate([np.zeros(int(lead * SAMPLE_RATE), dtype="<i2"), samples[cut_from:cut_to]])
+        shift = lead - cut_from / SAMPLE_RATE
+        marks = [{"index": i, "text": seg["text"], "spoken": seg["spoken"], "start": a + shift, "end": b + shift}
+                 for i, (seg, (a, b)) in enumerate(zip(segments, bounds), start=1)]
+        return trimmed, marks, sum(counts) / max(end - start, 1e-6), used_model, split
 
-    # Trim around the speech, then start after `lead` seconds.
-    keep = int(KEEP_EDGE_S * SAMPLE_RATE)
-    cut_from = max(0, int(start * SAMPLE_RATE) - keep)
-    cut_to = min(samples.size, int(end * SAMPLE_RATE) + keep)
-    track = np.concatenate([np.zeros(int(lead * SAMPLE_RATE), dtype="<i2"), samples[cut_from:cut_to]])
-    shift = lead - cut_from / SAMPLE_RATE
-    timings = [{"index": i, "text": seg["text"], "spoken": seg["spoken"], "start": a + shift, "end": b + shift}
-               for i, (seg, (a, b)) in enumerate(zip(segments, bounds), start=1)]
-    measured_rate = sum(counts) / max(end - start, 1e-6)
+    log(f"Video {index}: synthesising {len(lines)} lines in one request ({voice})")
+    track, timings, measured_rate, model, method = take(style)
+    faster_retry = False
+    budget = duration - END_MARGIN_S
+    if duration and track.size / SAMPLE_RATE > budget * max_speedup:
+        # Too long even at the maximum speed-up (a slow voice): ask once more, same voice,
+        # for a faster delivery, and keep the shorter of the two.
+        log(f"Video {index}: {track.size / SAMPLE_RATE:.2f}s is too long for {duration:.2f}s "
+            f"even at {max_speedup}x; asking {voice} to read faster")
+        faster_retry = True
+        retry = take(f"{style} {FASTER_STYLE}".strip())
+        if retry[0].size < track.size:
+            track, timings, measured_rate, model, method = retry
 
     # Too short: fill the video to (almost) the end, so there is no silent ending.
     # 1) longer pauses between lines (only where real pauses were found), 2) then a slightly
@@ -417,6 +436,7 @@ def render_video(video: dict, out_dir: Path, voice: str, accent: str, api_key: s
         "speech_duration": round(track.size / SAMPLE_RATE, 3),
         "speed": round(speed, 4),
         "added_pause": added_pause,
+        "faster_retry": faster_retry,
         "measured_rate": round(measured_rate, 2),
         "segments": timings,
     }

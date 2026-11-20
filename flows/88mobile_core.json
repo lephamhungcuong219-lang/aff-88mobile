@@ -1,5 +1,5 @@
 {
-  "name": "88mobile_aff",
+  "name": "88mobile_core",
   "nodes": [
     {
       "parameters": {},
@@ -35,7 +35,7 @@
           "cachedResultName": "Douyin Video Downloader & Scraper - No Watermark (hgservices/douyin-scraper)",
           "cachedResultUrl": "https://console.apify.com/actors/NaJlT9yHmCzCyHHuC/input"
         },
-        "customBody": "{\n  \"startUrls\": [\n    \"https://v.douyin.com/_rVkKHDtGKo/\"\n  ]\n}",
+        "customBody": "{\n  \"startUrls\": [\n    \"https://v.douyin.com/eeyYkYGUHOg/\"\n  ]\n}",
         "timeout": {},
         "memory": 4096,
         "maxTotalChargeUsd": {}
@@ -296,7 +296,7 @@
     "executionOrder": "v1",
     "binaryMode": "separate"
   },
-  "versionId": "b049eb2a-ff4b-48fe-a6c1-ec3ee11f0360",
+  "versionId": "f501d0d9-8778-4105-a37a-d377ce863cf3",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "e82d21276fd2c15d8c7594a7dcd1d0ea17f6e5e6c833f1173f5d5a67c49c0209"

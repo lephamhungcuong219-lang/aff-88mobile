@@ -180,11 +180,17 @@ tiếp cận riêng. Gemini chỉ trả về thứ tự cảnh; script kiểm tr
 | Output | `request.json` (request gửi đi), `gem_response.json` (response mọi lần gọi), `reorder.json` (chỉ khi thành công) — cùng thư mục |
 | stdout | `json:<reorder.json>` / `fail` (`--dry-run`: chỉ ghi `request.json`, stdout `json:<request.json>`) |
 
+**Số video đầu ra:** `REORDER_TARGET_VIDEOS` trong `.env` (hiện là **4**) = tạo đúng N video; để trống = Gemini tự quyết
+(tối thiểu đủ để dùng hết các cảnh). N được hạ xuống khi video gốc quá ngắn (cần ít nhất 8 giây mỗi video, mỗi cảnh
+dùng tối đa 2 lần). Khi N video × 20 giây không chứa hết video gốc (video gốc dài), vẫn giữ N video và **bỏ quy tắc dùng
+hết các cảnh** (Gemini chọn cảnh hay nhất). Các điều chỉnh này ghi trong `reorder.json` → `rules.notes`.
+
 Quy tắc kiểm tra (sai thì gửi lỗi lại cho Gemini trong cùng cuộc trò chuyện, tối đa 3 lần):
 
 - mỗi video 8-20 giây (mục tiêu 15 giây);
 - trong một video mỗi cảnh xuất hiện tối đa một lần;
-- mọi cảnh được dùng ít nhất một lần;
+- đúng `REORDER_TARGET_VIDEOS` video (nếu có đặt);
+- mọi cảnh được dùng ít nhất một lần (trừ khi bị bỏ như trên);
 - mỗi cảnh dùng trong tối đa 2 video;
 - hai video dùng chung tối đa 50% số cảnh của video ngắn hơn.
 
@@ -303,7 +309,7 @@ python -m post_process.gemini_voiceover "{{ $json.stdout.match(/^proxy:(.*)$/m)[
 ### 9. gemini_tts
 
 **Xoay vòng giọng:** mỗi video một giọng khác nhau, bốc ngẫu nhiên từ `GEMINI_TTS_VOICES` (mặc định Puck, Laomedeia,
-Sadachbia, Fenrir, Zephyr); giọng đã dùng trong vòng thì bỏ ra, hết danh sách mới sang vòng mới. Giọng được gán trước khi
+Sadachbia, Fenrir; Zephyr bị bỏ vì đọc chậm nhất); giọng đã dùng trong vòng thì bỏ ra, hết danh sách mới sang vòng mới. Giọng được gán trước khi
 gọi API nên video phải chuyển sang 3.1 vẫn giữ đúng giọng (hai model cùng tên giọng); chạy lại một phần (`--video`) thì
 giọng của các video giữ lại được tính là đã dùng. `--voice X` = một giọng cho mọi video.
 
@@ -332,7 +338,9 @@ các câu xuống dòng, và trả âm thanh PCM thô (script tự xử lý). `t
 chỉ khi tách câu bằng khoảng lặng), rồi đọc chậm lại một chút (không chậm hơn 0,92x), để giọng kết thúc khoảng 0,25s
 trước khi hết video (`added_pause`, `speed` trong `tts.json`).
 Khớp độ dài: giọng đọc dài hơn video (trừ 0,1s cuối) thì tăng tốc giữ nguyên cao độ (`atempo`), tối đa `--max-speedup`
-(1,15x); vẫn dài quá thì `E_TOO_LONG`, stderr gợi ý chạy lại `gemini_voiceover --video N --rate <tốc độ đo được>`.
+(1,15x). Nếu tăng tốc tối đa vẫn không đủ (giọng đọc chậm), video được **đọc lại 1 lần** bằng cùng giọng với yêu cầu
+đọc nhanh hơn (tốn thêm 1 request), giữ bản ngắn hơn (`faster_retry` trong `tts.json`); vẫn dài quá thì `E_TOO_LONG`,
+stderr gợi ý chạy lại `gemini_voiceover --video N --rate <tốc độ đo được>`.
 Tốc độ toàn bài bất thường (đọc sót/lặp chữ) thì hỏi lại 1 lần, vẫn sai thì `E_NO_OUTPUT`.
 Request giãn cách theo `GEMINI_TTS_RPM`; 429 theo phút và lỗi 400 "audio stream could not be completed ... retry"
 thì chờ rồi thử lại. Hạn mức Tier 1: 100 request/ngày mỗi model, tức khoảng 100 video/ngày với 3.8 (+ dự phòng 3.1);
@@ -394,7 +402,7 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
 
 | Ở đâu | Gì |
 |---|---|
-| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
+| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `REORDER_TARGET_VIDEOS` (bước 5); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
 | `Dockerfile` | Alpine 3.24 (`apk`), ffmpeg, font Noto, Python 3.14, OpenCV/numpy từ `apk`, `uv`, `post_process` copy vào `/opt/post_process` |
 | `docker-compose.yml` | `./media` -> `/data/media`, `./n8n_data` -> `/home/node/.n8n` |
 | Hằng số đầu mỗi script | ngưỡng quy tắc (thời lượng video, số lần dùng cảnh, kích thước caption, tốc độ đọc…) |
