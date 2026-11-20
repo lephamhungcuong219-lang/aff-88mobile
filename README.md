@@ -39,9 +39,11 @@ sudo timedatectl set-ntp true
 ```bash
 git clone <repo-url> ~/n8n-media    # hoặc scp/rsync thư mục này (không cần node_modules)
 cd ~/n8n-media
-mkdir -p n8n_data media
-sudo chown -R 1000:1000 n8n_data media   # container chạy với user node (uid 1000)
 ```
+Không cần tự tạo `n8n_data/`, `media/`: mỗi lần `docker compose up`, service `init-dirs` tạo `media/jobs` và
+`n8n_data` nếu chưa có và giao cho user `node` (uid 1000) của container, trước khi n8n khởi động.
+Nếu `n8n_data/` được copy từ máy khác (có sẵn file bên trong), chown cả thư mục một lần:
+`sudo chown -R 1000:1000 n8n_data`.
 
 ### 4. Tạo `.env`
 ```bash
@@ -76,3 +78,5 @@ docker compose up -d --build
   `DB_POSTGRESDB_*` trong `docker-compose.yml`; có thể chỉnh thêm trong `.env`. Supabase Session
   pooler giới hạn số kết nối, đừng đặt `DB_POSTGRESDB_POOL_SIZE` quá ~10.
 - Backup: `n8n_data/` (chứa `config` có encryption key) và `media/`. Workflow/credentials nằm trong Supabase.
+- Dọn job cũ: chỉ xoá bên trong `media/jobs/` (`rm -rf media/jobs/*`), **đừng xoá `media/`** khi container đang
+  chạy: mount `/data/media` bị hỏng và mọi job báo lỗi cho tới khi tạo lại thư mục hoặc `docker compose up -d`.

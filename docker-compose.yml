@@ -1,6 +1,26 @@
 
 services:
+  # Tạo ./media/jobs và ./n8n_data nếu chưa có, và giao cho user node (uid 1000) của n8n.
+  # Không có bước này, Docker trên Linux (VPS) tự tạo thư mục thiếu với chủ là root,
+  # n8n không ghi được (make_dir: Permission denied, n8n không lưu được config).
+  # Chỉ chown chính các thư mục này, không đệ quy (media có thể rất lớn).
+  init-dirs:
+    image: alpine:3.24
+    restart: "no"
+    network_mode: none
+    command:
+      - sh
+      - -c
+      - mkdir -p /mnt/media/jobs /mnt/n8n_data && chown 1000:1000 /mnt/media /mnt/media/jobs /mnt/n8n_data
+    volumes:
+      - ./media:/mnt/media
+      - ./n8n_data:/mnt/n8n_data
+
   n8n:
+    depends_on:
+      init-dirs:
+        condition: service_completed_successfully
+
     build:
       context: .
       dockerfile: Dockerfile

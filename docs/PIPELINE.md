@@ -244,7 +244,7 @@ Mọi chữ nằm trên dòng caption đều bị che (kể cả chữ to hơn c
 `--mode fill`: chỉ xoá chữ, không có tấm kính. `--preview DIR`: lưu ảnh trước/sau của từng clip (`panel|fill`), hoặc
 một khung hình có vẽ khung chữ dò được màu xanh (`detect`).
 
-`captions.json`: `{"mode", "caption_line": {"center_y", "height"}, "clips": {"<N>.mp4": {"caption", "method", "glyphs_removed", "detection", "box": {"x","y","w","h"}, "text_box": {"x","y","w","h"}, "start", "end", "hits", "mask_share"}}}`.
+`captions.json`: `{"mode", "caption_line": {"center_y", "height"}, "frame": {"width", "height"}, "clips": {"<N>.mp4": {"caption", "method", "glyphs_removed", "detection", "box": {"x","y","w","h"}, "text_box": {"x","y","w","h"}, "start", "end", "hits", "mask_share"}}}`.
 
 Lệnh n8n (sau `gemini_reorder`, stdout `json:.../reorder.json`):
 ```
@@ -378,6 +378,9 @@ python -m post_process.gemini_tts "{{ $json.stdout.trim().replace(/^json:/, '') 
 ### 10. compose_videos
 
 Ghép giọng đọc và phụ đề tiếng Việt vào video cuối (bước 7). Âm thanh gốc bị bỏ (mặc định).
+Video nhỏ hơn 4K được **phóng lên 2160x3840** (lanczos, `--height 3840` mặc định; không bao giờ thu nhỏ;
+`--height 0` giữ nguyên). Tấm kính và chữ được vẽ sau khi phóng nên vẫn nét; vùng che chữ Trung trong
+`captions.json` (toạ độ theo clip gốc, `frame`) được nhân theo tỉ lệ. Phóng to không thêm chi tiết, file nặng hơn khoảng 3 lần.
 Phụ đề: chữ trắng đậm (Noto Sans Bold) có bóng, hiện đúng `start`-`end` của từng câu trong `tts.json`,
 đặt giữa một tấm kính mờ (hình chữ nhật bo góc, căn giữa khung hình, trên dòng caption).
 - **Kích thước cố định cho cả video** (không phóng to thu nhỏ): chiều dài lớn nhất và chiều cao lớn nhất trong số
@@ -394,7 +397,7 @@ Phụ đề: chữ trắng đậm (Noto Sans Bold) có bóng, hiện đúng `sta
 
 | | |
 |---|---|
-| Lệnh | `python -m post_process.compose_videos <tts_json> <videos_dir> <output_dir> [--reorder FILE] [--captions FILE] [--music FILE] [--music-volume 0.12] [--original-volume 0] [--tint dark\|light] [--no-subtitles] [--video N ...]` |
+| Lệnh | `python -m post_process.compose_videos <tts_json> <videos_dir> <output_dir> [--reorder FILE] [--captions FILE] [--music FILE] [--music-volume 0.12] [--original-volume 0] [--tint dark\|light] [--no-subtitles] [--video N ...] [--height 3840]` |
 | Input | `tts_json`: `.../tts.json`; `videos_dir`: `<job>/output` (tìm `*video_<N>.mp4`); `output_dir`: `<job>/output/final` (phải khác `videos_dir`). Mặc định đọc `reorder.json` cạnh `tts.json` và `clean/captions.json` |
 | Output | `<output_dir>/<tên file như video vào>`: H.264 CRF 20 + AAC 192k, đúng độ dài video vào |
 | stdout | `dir:<output_dir>` / `fail` |

@@ -5,7 +5,7 @@ Usage:
     python compose_videos.py <tts_json> <videos_dir> <output_dir>
         [--reorder FILE] [--captions FILE]
         [--music FILE] [--music-volume 0.12] [--original-volume 0]
-        [--tint dark|light] [--no-subtitles] [--video N ...]
+        [--tint dark|light] [--no-subtitles] [--video N ...] [--height 3840]
 
 Inputs:
     tts_json    tts.json from gemini_tts.py (voice files + start/end of every line)
@@ -23,6 +23,9 @@ Two kinds of captions.json (its "mode"):
                 the panel grows over those old covers (OLD_COVER_OUTSET) to hide their edges.
 
 For every video in tts.json, writes <output_dir>/<same file name> with:
+  - size: upscaled (lanczos) to --height px high (default 3840, i.e. 4K 2160x3840 for 9:16)
+    when the video is smaller; never downscaled. The panel and the text are drawn after
+    the upscale, at full resolution, so they stay sharp. --height 0 keeps the video size.
   - audio: the voice track only (original sound removed). Optional background music
     (--music, looped, faded out) and/or the original sound at --original-volume.
   - subtitles: every line of tts.json shown from its start to its end, white bold
@@ -74,6 +77,8 @@ TINTS = {"dark": 0.72, "light": 1.10}  # brightness factor of the glass
 GLASS_SATURATION = 0.4    # colour kept in the glass (0 = grey): hides coloured caption leftovers
 CORNER = 0.22             # x panel height
 SHADOW = 0.06             # x font size: text shadow offset
+
+TARGET_HEIGHT = 3840      # default --height: 4K for vertical (9:16) videos
 
 ENCODE = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
 
@@ -147,8 +152,12 @@ def detect_mode(captions: dict | None) -> bool:
     return (captions or {}).get("mode") == "detect"
 
 
-def old_covers(plan_video: dict | None, captions: dict | None, width: int, height: int) -> list[tuple[float, float, Rect]]:
+def old_covers(plan_video: dict | None, captions: dict | None, width: int, height: int,
+               scale: float = 1.0) -> list[tuple[float, float, Rect]]:
     """When and where a Chinese caption must be covered, in this video's time.
+
+    Boxes in captions.json are in pixels of the clips; scale maps them to this video
+    (the clips' size -> the composed size, e.g. 2.0 for 1080x1920 upscaled to 4K).
 
     detect: the text box plus COVER_MARGIN, kept COVER_EDGE_MARGIN off the frame edges.
     panel/fill: remove_captions' own cover plus OLD_COVER_OUTSET, so its edge is hidden.
@@ -166,7 +175,7 @@ def old_covers(plan_video: dict | None, captions: dict | None, width: int, heigh
         info = clips.get(scene.get("source_file", ""))
         if not (info and info.get("caption") and (info.get(key) or info.get("box"))):
             continue
-        b = info.get(key) or info["box"]
+        b = {k: int(round(v * scale)) for k, v in (info.get(key) or info["box"]).items()}
         start = float(scene["out_start"]) + float(info.get("start", 0))
         end = min(float(scene["out_end"]), float(scene["out_start"]) + float(info.get("end", scene["duration"])))
         if end > start:
@@ -216,9 +225,19 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
 
     filters, inputs = [], ["-i", str(source), "-i", str(voice)]
     layout = None
+    # Upscale first (never down): everything below is drawn at the final size.
+    base = "[0:v]"
+    if args.height and height < args.height:
+        out_h = args.height // 2 * 2
+        out_w = max(2, round(width * out_h / height / 2) * 2)
+        filters.append(f"[0:v]scale={out_w}:{out_h}:flags=lanczos,setsar=1[up]")
+        base, width, height = "[up]", out_w, out_h
+    # captions.json boxes are in pixels of the clips (its "frame"; older reports have none:
+    # the clips are as big as the rendered video).
+    frame_h = float((captions or {}).get("frame", {}).get("height") or info["height"])
     # Chinese captions to cover: in detect mode they are still in the video, so the panel
     # is drawn even with --no-subtitles.
-    covers = old_covers(plan_video, captions, width, height)
+    covers = old_covers(plan_video, captions, width, height, height / frame_h)
     with_text = not args.no_subtitles and bool(segments)
     with_panel = with_text or bool(covers and detect_mode(captions))
     if with_panel:
@@ -263,8 +282,8 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
             blur = max(blur, COVER_BLUR * line_h * height)  # the raw glyphs must not show through
         if panels:
             labels = "".join(f"[cut{k}]" for k in range(len(panels)))
-            filters.append(f"[0:v]split={len(panels) + 1}[base]{labels}")
-        chain = "[base]" if panels else "[0:v]"
+            filters.append(f"{base}split={len(panels) + 1}[base]{labels}")
+        chain = "[base]" if panels else base
         first_mask_input = 2
         for k, ((px, py, pw, ph), spans) in enumerate(panels):
             mask = work / f"v{index}_mask{k}.png"
@@ -301,10 +320,11 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
                           f"x=(w-text_w)/2:y={text_y}:y_align=font:"
                           f"enable='between(t,{seg['start']:.3f},{seg['end']:.3f})'")
         filters.append(chain + "[v]")
-        layout = {"font_size": font or None, "tint": args.tint, "blur": round(blur, 1),
+        layout = {"size": f"{width}x{height}", "font_size": font or None, "tint": args.tint, "blur": round(blur, 1),
                   "panels": [{"x": r[0], "y": r[1], "w": r[2], "h": r[3], "times": s} for r, s in panels]}
     else:
-        filters.append("[0:v]null[v]")
+        filters.append(f"{base}null[v]")
+        layout = {"size": f"{width}x{height}"}
 
     # Audio: voice (+ music) (+ original), exactly as long as the video.
     mix = ["[1:a]aresample=48000,apad[voice]"]
@@ -373,6 +393,8 @@ def main() -> int:
     parser.add_argument("--tint", choices=sorted(TINTS), default="dark", help="Glass tint (default dark: white text reads best)")
     parser.add_argument("--no-subtitles", action="store_true", help="Only replace the audio")
     parser.add_argument("--video", type=int, nargs="+", help="Only these video indexes")
+    parser.add_argument("--height", type=int, default=TARGET_HEIGHT,
+                        help=f"Upscale smaller videos to this height in px (default {TARGET_HEIGHT} = 4K); 0 keeps the size")
     args = parser.parse_args()
 
     tts_file = args.tts_json.expanduser().resolve()
@@ -389,6 +411,8 @@ def main() -> int:
             args.music = args.music.expanduser().resolve()
             if not args.music.is_file():
                 raise ComposeError(f"Music file not found: {args.music}")
+        if args.height and args.height < 16:
+            raise ComposeError(f"--height must be 0 or at least 16 px: {args.height}")
         for name in ("music_volume", "original_volume"):
             if not 0 <= getattr(args, name) <= 2:
                 raise ComposeError(f"--{name.replace('_', '-')} must be between 0 and 2")

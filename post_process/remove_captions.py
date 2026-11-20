@@ -571,6 +571,9 @@ def main() -> int:
         report = {"mode": args.mode, "caption_line": None, "clips": {}}
         if line:
             report["caption_line"] = {"center_y": round(line[0], 4), "height": round(line[1], 4)}
+        # Pixel boxes below are in this frame size (compose_videos scales them when it upscales).
+        first = infos[clips[0].name]
+        report["frame"] = {"width": first["width"], "height": first["height"]}
 
         counts = {"panel": 0, "fill": 0, "detect": 0}
         for clip in clips:
