@@ -35,7 +35,9 @@ Bước 6 không phụ thuộc bước 4-5: có thể chạy ngay sau bước 3 
   Trong container **không dùng `uv run`**.
 - Đường dẫn trong container: thư mục `/data/media` = `C:\Code\n8n-media\media` trên máy.
   Mọi file phải đọc/ghi trong `/data/media` (n8n giới hạn bằng `N8N_RESTRICT_FILE_ACCESS_TO`).
-- **stdout** chỉ có kết quả (một dòng, riêng `render_videos` có thể hai dòng); **stderr** là nhật ký tiến trình
+- **stdout**: dòng đầu là kết quả. Có thêm dòng sau ở `render_videos` (`proxy:`), `split_video` (`long_scenes:`) và
+  `gemini_reorder` (`overlap:`); với các bước này n8n lấy kết quả bằng `.match(/^dir:(.*)$/m)[1]` (hoặc `json:`, `proxy:`)
+  thay vì `.trim().replace(...)`. **stderr** là nhật ký tiến trình
   và lý do lỗi. Exit code `0` = thành công, `1` = thất bại; khi thất bại stdout luôn là `fail`.
 - Tiền tố stdout:
 
@@ -85,6 +87,7 @@ Bước 6 không phụ thuộc bước 4-5: có thể chạy ngay sau bước 3 
     └── <awemeId>/
         ├── sources/<N>.mp4           các cảnh, chất lượng gốc, còn caption    [3]
         ├── scenelog.csv / .json      danh sách cảnh + thời gian               [3]
+        ├── stats.json                thống kê: long_scenes [3], overlaps [5]
         ├── runlog.txt                log của scenedetect                      [3]
         ├── compressed/<N>.mp4        bản nhỏ 480p có nhãn SCENE N             [4]
         ├── request.json              request gửi Gemini (lên kế hoạch)        [5]
@@ -143,7 +146,20 @@ Cắt video thành các cảnh bằng PySceneDetect, đặt tên `1.mp4`, `2.mp4
 | Lệnh | `python -m post_process.split_video <input_video> <output_dir>` |
 | Input | `input_video`: video từ bước 2; `output_dir`: `<job>/temp/<awemeId>/sources` |
 | Output | `<output_dir>/<N>.mp4`; ở thư mục cha: `scenelog.csv`, `scenelog.json`, `runlog.txt` |
-| stdout | `dir:<output_dir>` / `fail` |
+| stdout | `dir:<output_dir>` rồi một dòng `long_scenes:` / `fail` |
+
+Dòng `long_scenes:` (cũng ghi vào `stats.json`) thống kê các cảnh dài **từ 3 giây trở lên** (`LONG_SCENE_S`), dạng
+`long_scenes:<số cảnh ≥ 3s>_<tổng số cảnh>-<số thứ tự các cảnh đó, tăng dần, nối bằng _>`;
+không có cảnh nào thì bỏ cả phần `-...`:
+
+```
+long_scenes:4_47-4_6_7_18     4 trên 47 cảnh dài ≥ 3s: cảnh 4, 6, 7, 18
+long_scenes:0_47              không có cảnh nào
+```
+
+Parse trong n8n (Code node hoặc biểu thức):
+`const [, long, total, list] = $json.stdout.match(/^long_scenes:(\d+)_(\d+)(?:-([\d_]+))?$/m);`
+`const scenes = list ? list.split('_').map(Number) : [];`
 
 Lệnh n8n (sau `download_media`, stdout `mp4:.../input/<awemeId>.mp4`):
 ```
@@ -166,7 +182,7 @@ in nhãn `SCENE N` ở góc trên trái. Clip gốc không bị sửa.
 
 Lệnh n8n (sau `split_video`, stdout `dir:.../sources`):
 ```
-python -m post_process.compress_clips "{{ $json.stdout.trim().replace(/^dir:/, '') }}" "{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\/sources$/, '/compressed') }}"
+python -m post_process.compress_clips "{{ $json.stdout.match(/^dir:(.*)$/m)[1].trim() }}" "{{ $json.stdout.match(/^dir:(.*)$/m)[1].trim().replace(/\/sources$/, '/compressed') }}"
 ```
 
 ### 5. gemini_reorder
@@ -180,16 +196,57 @@ tiếp cận riêng. Gemini chỉ trả về thứ tự cảnh; script kiểm tr
 | Input | `scenelog_json`: `.../scenelog.json`; `clips_dir`: `.../compressed`; `output_json`: `.../reorder.json` |
 | Môi trường | `GEMINI_API_KEY` (bắt buộc), `GEMINI_MODEL` (mặc định `gemini-3.8-flash`) |
 | Output | `request.json` (request gửi đi), `gem_response.json` (response mọi lần gọi), `reorder.json` (chỉ khi thành công) — cùng thư mục |
-| stdout | `json:<reorder.json>` / `fail` (`--dry-run`: chỉ ghi `request.json`, stdout `json:<request.json>`) |
+| stdout | `json:<reorder.json>` rồi các dòng `overlap:`, `overlap_video:` / `fail` (`--dry-run`: chỉ ghi `request.json`, stdout `json:<request.json>`) |
+
+**Kiểm tra đoạn trùng:** sau khi có kế hoạch hợp lệ, script tìm các đoạn **từ 2 cảnh liên tiếp trở lên** (cùng cảnh,
+cùng thứ tự) xuất hiện ở từ hai video trở lên, ví dụ video 1 `1,2,3,4,9` và video 2 `7,2,3,4,19` trùng đoạn `2-3-4`.
+Một đoạn nằm ở nhiều video chỉ in **một dòng** kèm mọi video có nó. Thời lượng một đoạn = tổng thời lượng các cảnh
+của nó. Mỗi đoạn trùng một dòng `overlap:`, rồi mỗi video một dòng `overlap_video:` (số giây: 3 chữ số thập phân):
+```
+overlap:<các video, nối bằng _>-<các cảnh, nối bằng _>-<số giây>
+overlap_video:<video>-<số giây bị trùng với video khác>_<thời lượng video>
+
+overlap:1_2_3-2_3_4-2.700       video 1, 2 và 3 cùng có đoạn cảnh 2, 3, 4, dài 2.7s
+overlap:1_4-10_11-1.733
+overlap_video:1-4.433_6.700     video 1: 4.433s trên 6.7s bị trùng (mỗi cảnh tính một lần)
+overlap_video:2-2.700_5.500
+overlap_video:3-2.700_4.333
+overlap_video:4-1.733_4.366     (video không trùng gì: 0.000_...)
+```
+Không có đoạn trùng nào thì không có dòng `overlap:`, các dòng `overlap_video:` đều là `0.000`.
+Đây chỉ là thống kê, không làm job thất bại.
+
+**`stats.json`** (`temp/<awemeId>/stats.json`, module `job_stats.py`): bản đầy đủ của các thống kê trên stdout, để xem
+lại sau. `split_video` tạo mới file với khóa `long_scenes` (thêm `durations`, `long_seconds`, `total_seconds`);
+`gemini_reorder` thêm khóa `overlaps` (`runs`, `per_video` có `shared_ratio`), xoá khóa này khi bắt đầu chạy lại.
+
+Gom stdout của cả hai bước thành một JSON trong n8n: Code node [flows/code/job_stats.js](../flows/code/job_stats.js)
+(cấu trúc giống `stats.json`). Đặt ở nhánh riêng, không chèn giữa chuỗi node.
+
+**Gửi thống kê lên Discord** (công cụ cho người phát triển, không phải tính năng): nhánh riêng từ node "Nấu các cảnh"
+→ Code node [flows/code/discord_stats.js](../flows/code/discord_stats.js) (mode "Run Once for Each Item") đọc
+`stats.json` + `reorder.json`, trả về `content` (tin nhắn ≤ 2000 ký tự: cảnh dài, % trùng từng video, các đoạn trùng)
+và `color` (xanh < 20% trùng, vàng < 50%, đỏ ≥ 50%) → node Discord gửi `{{ $json.content }}`.
 
 **Số video đầu ra:** `REORDER_TARGET_VIDEOS` trong `.env` (hiện là **4**) = tạo đúng N video; để trống = Gemini tự quyết
-(tối thiểu đủ để dùng hết các cảnh). N được hạ xuống khi video gốc quá ngắn (cần ít nhất 8 giây mỗi video, mỗi cảnh
-dùng tối đa 2 lần). Khi N video × 20 giây không chứa hết video gốc (video gốc dài), vẫn giữ N video và **bỏ quy tắc dùng
-hết các cảnh** (Gemini chọn cảnh hay nhất). Các điều chỉnh này ghi trong `reorder.json` → `rules.notes`.
+(tối thiểu đủ để dùng hết các cảnh). N được hạ xuống khi video gốc quá ngắn (cần ít nhất thời lượng tối thiểu mỗi video,
+mỗi cảnh dùng tối đa 2 lần). Khi N video × thời lượng tối đa không chứa hết video gốc (video gốc dài), vẫn giữ N video và
+**bỏ quy tắc dùng hết các cảnh** (Gemini chọn cảnh hay nhất). Các điều chỉnh này ghi trong `reorder.json` → `rules.notes`.
+
+**Thời lượng mỗi video:** `TARGET_VIDEO_S` trong `.env` (mặc định **15**). Khoảng cho phép đi theo mục tiêu:
+tối đa = mục tiêu + 5 giây, tối thiểu = min(8, mục tiêu − 5) giây. Ví dụ 15 → 8-20s, 10 → 5-15s, 30 → 8-35s.
+Mục tiêu phải từ 6 giây trở lên, hoặc **0 = mục tiêu là độ dài video gốc**: khoảng cho phép theo cùng công thức (gốc 49s →
+8-54s; thực tế không quá độ dài gốc vì một video không lặp cảnh), không bắt mỗi video dùng đủ mọi cảnh; khi đó bỏ hai
+quy tắc "mỗi cảnh tối đa 2 video" và "dùng chung tối đa 50%" (chỉ cấm hai video giống hệt nhau), số video
+`REORDER_TARGET_VIDEOS` được giữ nguyên, không bị hạ. Giá trị dùng thực tế ghi trong `reorder.json` → `rules`
+(`full_source`, `target_video_s`, `min_video_s`, `max_video_s`).
+
+**Ưu tiên khi chỉnh: giảm trùng cảnh giữa các video, nhưng vẫn giữ đủ nội dung.** Mỗi video phải tự đứng được
+(mở đầu, các ý chính của góc tiếp cận, kêu gọi mua), không cắt bớt ý chỉ để né trùng.
 
 Quy tắc kiểm tra (sai thì gửi lỗi lại cho Gemini trong cùng cuộc trò chuyện, tối đa 3 lần):
 
-- mỗi video 8-20 giây (mục tiêu 15 giây);
+- mỗi video trong khoảng cho phép ở trên (mặc định 8-20 giây, mục tiêu 15 giây);
 - trong một video mỗi cảnh xuất hiện tối đa một lần;
 - đúng `REORDER_TARGET_VIDEOS` video (nếu có đặt);
 - mọi cảnh được dùng ít nhất một lần (trừ khi bị bỏ như trên);
@@ -248,7 +305,7 @@ một khung hình có vẽ khung chữ dò được màu xanh (`detect`).
 
 Lệnh n8n (sau `gemini_reorder`, stdout `json:.../reorder.json`):
 ```
-python -m post_process.remove_captions "{{ $json.stdout.trim().replace(/^json:/, '').replace(/\/reorder\.json$/, '/sources') }}" "{{ $json.stdout.trim().replace(/^json:/, '').replace(/\/reorder\.json$/, '/clean') }}"
+python -m post_process.remove_captions "{{ $json.stdout.match(/^json:(.*)$/m)[1].trim().replace(/\/reorder\.json$/, '/sources') }}" "{{ $json.stdout.match(/^json:(.*)$/m)[1].trim().replace(/\/reorder\.json$/, '/clean') }}"
 ```
 
 ### 7. render_videos
@@ -264,8 +321,10 @@ Mỗi video ghép đủ mọi cảnh, nguyên độ dài (không phải bản t�
 | Output | `<output_dir>/<prefix>video_<N>.mp4`, `<proxy_dir>/proxy_<prefix>video_<N>.mp4` |
 | stdout | dòng 1 `dir:<output_dir>`, dòng 2 `proxy:<proxy_dir>` (khi có `--proxy-dir`) / `fail` |
 
-Kiểm tra: thiếu clip nào (ở cả hai thư mục) thì báo ngay trước khi render; thời lượng video lệch quá 0,5 giây so với
-`total_duration` thì `fail`; tham số đầu không phải file `reorder.json`, hoặc `--proxy-dir` trùng thư mục khác, thì `fail`.
+Kiểm tra: thiếu clip nào (ở cả hai thư mục) thì báo ngay trước khi render; một clip lệch quá 0,25 giây so với
+`duration` của cảnh trong kế hoạch (clip sai/hỏng) thì `fail`; video render lệch quá 0,5 giây so với tổng thời lượng
+đo thật của các clip (lỗi khi ghép) thì `fail` (không so với `total_duration`: con số này cộng từ CSV, còn mỗi file
+clip dài hơn vài ms do đệm AAC, cộng dồn qua nhiều cảnh); tham số đầu không phải file `reorder.json`, hoặc `--proxy-dir` trùng thư mục khác, thì `fail`.
 Video được encode lại (H.264 CRF 20 + AAC 192k) để tránh lỗi âm thanh ở chỗ nối. `--no-audio` bỏ âm thanh gốc.
 
 Lệnh n8n (sau `remove_captions`, stdout `dir:.../clean`):
@@ -307,6 +366,8 @@ trong 85-108% của `thời lượng × --rate` (mục tiêu 95%; `--rate` mặc
 }
 ```
 `text` dùng làm phụ đề, `spoken` dùng cho TTS (số, ký hiệu, viết tắt đã viết thành chữ).
+Script kiểm tra từng đoạn: `spoken` phải đọc đúng từng chữ tiếng Việt của `text` (chỉ số, ký hiệu, viết tắt, từ
+nước ngoài được viết khác). Thừa chữ, bỏ hoặc đổi chữ có dấu thì gửi lại Gemini sửa (tối đa 3 lần), nếu không thì `fail`.
 
 Lệnh n8n (sau `render_videos`):
 ```
@@ -322,8 +383,10 @@ giọng của các video giữ lại được tính là đã dùng. `--voice X` 
 
 Đọc lời thoại bằng Gemini TTS, **giọng miền Nam** (câu cố định thêm vào phong cách đọc,
 đổi bằng `--accent`). **Mỗi video chỉ 1 request**: mọi câu được đọc liền một lần (ngữ điệu liền mạch).
-Gemini TTS không trả timestamp, nên script tìm ranh giới câu: các khoảng lặng dài nhất nằm gần vị trí dự kiến
-(dự kiến theo số âm tiết). Nếu kết quả không hợp lý (câu quá ngắn, tốc độ bất thường) thì chia theo số âm tiết;
+Gemini TTS không trả timestamp, nên script tìm ranh giới câu: chọn **cùng lúc** bộ khoảng lặng cho khoảng dừng
+dài nhất và tốc độ đọc đều nhất giữa các câu (quy hoạch động; chọn từng chỗ gần vị trí dự kiến hay lấy nhầm chỗ ngắt
+hơi giữa câu, làm phụ đề hiện sớm hơn giọng). Xét cả khoảng lặng rất ngắn (≥10ms): TTS hay đọc liền
+hai câu, thiếu một chỗ ngắt là các câu ở giữa lệch dây chuyền. Không bộ nào hợp lý (câu quá ngắn, tốc độ bất thường) thì chia theo số âm tiết;
 cách đã dùng ghi ở `split` (`silence` / `proportional` / `single`). Sau đó cắt khoảng lặng hai đầu, giọng bắt đầu sau 0,15s.
 
 **Model và dự phòng:** `gemini-3.8-flash-tts` trước; khi nó báo **hết hạn mức ngày** thì chuyển **ngay** sang
@@ -415,7 +478,7 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
 
 | Ở đâu | Gì |
 |---|---|
-| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `REORDER_TARGET_VIDEOS` (bước 5); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
+| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `REORDER_TARGET_VIDEOS`, `TARGET_VIDEO_S` (bước 5); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
 | `Dockerfile` | Alpine 3.24 (`apk`), ffmpeg, font Noto, Python 3.14, OpenCV/numpy từ `apk`, `uv`, `post_process` copy vào `/opt/post_process` |
 | `docker-compose.yml` | `./media` -> `/data/media`, `./n8n_data` -> `/home/node/.n8n` |
 | Hằng số đầu mỗi script | ngưỡng quy tắc (thời lượng video, số lần dùng cảnh, kích thước caption, tốc độ đọc…) |

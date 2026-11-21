@@ -5,7 +5,9 @@ Usage:
     python split_scenes.py <input_video> <output_dir>
 
 Stdout: 'dir:<absolute output_dir>' (the folder with the clips) on success,
-        or exactly 'fail'.
+        followed by one line 'long_scenes:<long>_<total>[-<n>_<n>...]' (scenes lasting
+        at least LONG_SCENE_S, ascending; see long_scene_line), or exactly 'fail'.
+        Read the path with /^dir:(.*)$/m.
 Stderr: the reason for a failure (human-readable).
 Exit code: 0 for success, 1 for failure.
 
@@ -14,6 +16,7 @@ Files:
     <output_dir>/../runlog.txt
     <output_dir>/../scenelog.csv
     <output_dir>/../scenelog.json
+    <output_dir>/../stats.json    "long_scenes" (job_stats.py); written fresh on every run
 """
 
 import argparse
@@ -23,6 +26,11 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+
+try:  # python -m post_process.split_video
+    from post_process.job_stats import stats_path, update_stats
+except ImportError:  # python post_process/split_video.py
+    from job_stats import stats_path, update_stats
 
 
 def _convert_value(value: str):
@@ -38,7 +46,35 @@ def _convert_value(value: str):
         return text
 
 
-def csv_to_json(csv_path: Path, json_path: Path) -> None:
+LONG_SCENE_S = 3.0  # scenes lasting at least this long are counted on stdout
+
+
+def long_scene_stats(scenes: list[dict]) -> dict:
+    """Scenes lasting at least LONG_SCENE_S (stats.json -> "long_scenes")."""
+    lengths = {int(s["Scene Number"]): float(s.get("Length (seconds)") or 0) for s in scenes}
+    long = sorted(n for n, length in lengths.items() if length >= LONG_SCENE_S)
+    return {
+        "threshold_s": LONG_SCENE_S,
+        "long_count": len(long),
+        "scene_count": len(lengths),
+        "scenes": long,
+        "durations": {str(n): round(lengths[n], 3) for n in long},
+        "long_seconds": round(sum(lengths[n] for n in long), 3),
+        "total_seconds": round(sum(lengths.values()), 3),
+    }
+
+
+def long_scene_line(stats: dict) -> str:
+    """Stdout line 'long_scenes:<long count>_<scene count>[-<long scene numbers joined by _>]'.
+
+    Scene numbers ascending; no '-' part when none is long,
+    e.g. 'long_scenes:4_47-4_6_7_18', 'long_scenes:0_47'.
+    """
+    line = f"long_scenes:{stats['long_count']}_{stats['scene_count']}"
+    return f"{line}-{'_'.join(map(str, stats['scenes']))}" if stats["scenes"] else line
+
+
+def csv_to_json(csv_path: Path, json_path: Path) -> list[dict]:
     """Convert a PySceneDetect scene CSV into JSON.
 
     PySceneDetect's CSV may start with a 'Timecode List:' row (cut points)
@@ -68,6 +104,7 @@ def csv_to_json(csv_path: Path, json_path: Path) -> None:
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     tmp_path.replace(json_path)
+    return scenes
 
 
 def fail(reason: str, log: Path | None = None, details: str = "") -> int:
@@ -153,11 +190,19 @@ def main() -> int:
             return fail(f"Could not rename clips in {output}", log, traceback.format_exc())
 
         try:
-            csv_to_json(csv, json_file)
+            scenes = csv_to_json(csv, json_file)
         except Exception:
             return fail(f"Could not convert {csv} to JSON", log, traceback.format_exc())
 
-        print(f"dir:{output}")
+        try:
+            stats = long_scene_stats(scenes)
+            # New scenes: start stats.json over (overlaps of an older plan no longer apply).
+            update_stats(stats_path(meta_dir), "long_scenes", stats, reset=True)
+        except Exception:
+            return fail(f"Could not write {stats_path(meta_dir)}", log, traceback.format_exc())
+
+        print(f"dir:{output}")  # always the first line: n8n reads it with /^dir:(.*)$/m
+        print(long_scene_line(stats))
         return 0
     except Exception:
         return fail("Unexpected error", log, traceback.format_exc())

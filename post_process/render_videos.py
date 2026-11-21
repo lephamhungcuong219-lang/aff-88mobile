@@ -20,8 +20,15 @@ Typical call (captions are covered later by compose_videos.py, see remove_captio
 --mode detect, so the final videos and the proxies both come from the original clips):
     render_videos.py reorder.json sources/ output/ --proxy-dir proxy/ --proxy-clips sources/
 
-Each rendered video (final and proxy) is checked against the plan: its length
-must match "total_duration" within DURATION_TOLERANCE_S, otherwise the run fails.
+Each rendered video (final and proxy) is checked, otherwise the run fails:
+  - every clip, as measured by ffprobe, must last its scene's planned "duration"
+    within CLIP_TOLERANCE_S (catches wrong or damaged clips);
+  - the rendered length must match the SUM OF THE MEASURED CLIP LENGTHS within
+    DURATION_TOLERANCE_S (catches a broken join). It is not compared with the
+    plan's "total_duration": that is summed from the scene CSV, and every clip
+    file runs a few ms longer (AAC frame padding), which adds up over many scenes.
+Each clip's sound is cut (or padded) to the length of its picture before joining,
+so the sound stays in sync at every cut instead of drifting behind.
 
 The clips are re-encoded (H.264 + AAC, faststart) rather than stream-copied:
 joining with -c copy can leave small audio gaps or glitches at every cut, which
@@ -43,7 +50,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-DURATION_TOLERANCE_S = 0.5  # fail when the rendered length differs more than this from the plan
+DURATION_TOLERANCE_S = 0.5  # fail when the rendered length differs more than this from the clips' sum
+CLIP_TOLERANCE_S = 0.25     # fail when a clip file differs more than this from its planned scene length
 
 
 class RenderError(Exception):
@@ -58,7 +66,7 @@ def probe(path: Path) -> dict:
     """Return video size/fps and audio presence/format of a clip."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries",
-         "stream=codec_type,width,height,r_frame_rate,sample_rate:format=duration",
+         "stream=codec_type,width,height,r_frame_rate,sample_rate,duration:format=duration",
          "-of", "json", str(path)],
         capture_output=True, text=True, errors="replace", check=False,
     )
@@ -77,6 +85,8 @@ def probe(path: Path) -> dict:
         "has_audio": audio is not None,
         "sample_rate": int(audio["sample_rate"]) if audio else None,
         "duration": float(data.get("format", {}).get("duration", 0) or 0),
+        # Length of the picture alone: the audio of a clip usually runs a few ms longer.
+        "video_duration": float(video.get("duration") or data.get("format", {}).get("duration", 0) or 0),
     }
 
 
@@ -118,12 +128,15 @@ def build_command(clips: list[Path], infos: list[dict], target: Path, audio: boo
             # Extra silent input, exactly as long as this clip.
             silence = len(clips) + silence_inputs
             silence_inputs += 1
-            command += ["-f", "lavfi", "-t", f"{info['duration']:.3f}",
+            command += ["-f", "lavfi", "-t", f"{info['video_duration']:.3f}",
                         "-i", f"anullsrc=channel_layout=stereo:sample_rate={rate}"]
             source = f"[{silence}:a]"
+        # Cut (or pad) the sound to exactly the picture's length: AAC rounds every clip's
+        # audio up to whole frames, and joined untrimmed that adds ~10-20 ms per cut, so
+        # the sound drifts behind the picture and the video ends up longer than its scenes.
         filters.append(
             f"{source}aresample={rate},aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"asetpts=PTS-STARTPTS[a{index}]"
+            f"asetpts=PTS-STARTPTS,apad,atrim=end={info['video_duration']:.6f}[a{index}]"
         )
         labels.append(f"[a{index}]")
 
@@ -142,7 +155,9 @@ def build_command(clips: list[Path], infos: list[dict], target: Path, audio: boo
     return command
 
 
-def render_video(video: dict, sources_dir: Path, target: Path, audio: bool, out_height: int | None) -> float:
+def render_video(video: dict, sources_dir: Path, target: Path, audio: bool,
+                 out_height: int | None) -> tuple[float, float]:
+    """Render one video; return (rendered length, sum of the measured clip lengths)."""
     scenes = sorted(video.get("scenes") or [], key=lambda s: s.get("position", 0))
     if not scenes:
         raise RenderError(f"Video {video.get('video_index')} has no scenes")
@@ -159,6 +174,12 @@ def render_video(video: dict, sources_dir: Path, target: Path, audio: bool, out_
             raise RenderError(f"Missing clip for scene {scene.get('scene_number')}: {clip}")
         clips.append(clip)
     infos = [probe(clip) for clip in clips]
+    for scene, clip, info in zip(scenes, clips, infos):
+        planned = float(scene.get("duration") or 0)
+        if planned and abs(info["video_duration"] - planned) > CLIP_TOLERANCE_S:
+            raise RenderError(f"Clip {clip.name} (scene {scene.get('scene_number')}) lasts "
+                              f"{info['video_duration']:.2f}s but the plan says {planned:.2f}s "
+                              f"(tolerance {CLIP_TOLERANCE_S}s): wrong or damaged clip")
 
     tmp = target.with_name(target.stem + ".rendering.mp4")
     command = build_command(clips, infos, tmp, audio, out_height)
@@ -167,19 +188,19 @@ def render_video(video: dict, sources_dir: Path, target: Path, audio: bool, out_
         tmp.unlink(missing_ok=True)
         raise RenderError(f"ffmpeg failed for {target.name}:\n{result.stderr.strip()[-3000:]}")
     tmp.replace(target)
-    return probe(target)["duration"]
+    return probe(target)["duration"], sum(info["video_duration"] for info in infos)
 
 
 def render_checked(video: dict, clips_dir: Path, target: Path, audio: bool, height: int | None) -> None:
     """Render one video and fail if its length does not match the plan."""
     count = len(video.get("scenes") or [])
     log(f"Rendering {target.name} ({count} scenes)")
-    duration = render_video(video, clips_dir, target, audio, height)
-    expected = float(video.get("total_duration") or 0)
-    if expected and abs(duration - expected) > DURATION_TOLERANCE_S:
-        raise RenderError(f"{target.name} lasts {duration:.2f}s but the plan says {expected:.2f}s "
-                          f"(tolerance {DURATION_TOLERANCE_S}s): scenes may be missing or wrong clips used")
-    log(f"{target.name}: {duration:.2f}s, {count} scenes (planned {expected:.2f}s)")
+    duration, clips_total = render_video(video, clips_dir, target, audio, height)
+    if abs(duration - clips_total) > DURATION_TOLERANCE_S:
+        raise RenderError(f"{target.name} lasts {duration:.2f}s but its clips add up to {clips_total:.2f}s "
+                          f"(tolerance {DURATION_TOLERANCE_S}s): the join lost or added footage")
+    planned = float(video.get("total_duration") or 0)
+    log(f"{target.name}: {duration:.2f}s, {count} scenes (clips {clips_total:.2f}s, planned {planned:.2f}s)")
 
 
 def main() -> int:

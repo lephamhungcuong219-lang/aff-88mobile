@@ -25,6 +25,10 @@ Environment:
     GEMINI_MODEL     optional, default below
     REORDER_TARGET_VIDEOS  optional: make exactly this many videos (see video_policy);
                      empty = Gemini decides (at least enough to use every scene)
+    TARGET_VIDEO_S   optional: target length of each video in seconds, default 15
+                     (allowed range follows it, see video_length); 0 = the source length
+                     is the target (same range formula), and scenes may be shared
+                     by any number of videos
 
 Files (next to <output_json>):
     request.json        the request body sent to Gemini (first call; retries
@@ -35,12 +39,18 @@ Files (next to <output_json>):
                         after each attempt, so it also exists after a failure
     <output_json>       the final plan (Gemini's choices + timestamps computed
                         from scenelog.json); only written on success
+    stats.json          "overlaps" (find_overlaps) is set on success, removed when a run
+                        starts; the "long_scenes" of split_video.py is kept (job_stats.py)
 
 --dry-run only writes request.json, without calling Gemini (useful to inspect
 size and prompt).
 
 Stdout: 'json:<absolute output_json>' on success ('json:<request.json>' with
-        --dry-run), or exactly 'fail'.
+        --dry-run), or exactly 'fail'. On success the 'json:' line is followed by
+        'overlap:<videos>-<scenes>-<seconds>' lines (runs of 2+ consecutive scenes that
+        two or more videos share, one line per run) and
+        'overlap_video:<video>-<shared s>_<video s>' lines (see overlap_lines; also saved
+        in stats.json -> "overlaps"). Read the path with /^json:(.*)$/m.
 Stderr: progress; a failure is one line "[gemini_reorder] <CODE>: <message>" with the codes
         of gemini_errors.py (E_QUOTA_DAILY is reported at once, without retrying).
 Exit code: 0 for success, 1 for failure.
@@ -62,18 +72,27 @@ try:  # python -m post_process.gemini_reorder
     from post_process.gemini_errors import (E_AUTH, E_INVALID_ANSWER, E_NETWORK, E_NO_OUTPUT,
                                             E_UNEXPECTED, GeminiError, format_error, http_error,
                                             is_daily_quota, parse_retry_after)
+    from post_process.job_stats import stats_path, update_stats
 except ImportError:  # python post_process/gemini_reorder.py
     from gemini_errors import (E_AUTH, E_INVALID_ANSWER, E_NETWORK, E_NO_OUTPUT, E_UNEXPECTED,
                                GeminiError, format_error, http_error, is_daily_quota, parse_retry_after)
+    from job_stats import stats_path, update_stats
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 KEY_PLACEHOLDER = "your-gemini-api-key-here"
 
-# Output video rules
-TARGET_VIDEO_S = 15.0
-MAX_VIDEO_S = 20.0     # hard limit (target + allowed tolerance)
-MIN_VIDEO_S = 8.0      # shorter videos are not worth publishing
+# Output video rules. TARGET_VIDEO_S comes from .env (see video_length); MAX/MIN follow it.
+DEFAULT_TARGET_VIDEO_S = 15.0
+VIDEO_S_TOLERANCE = 5.0  # allowed distance from the target, both ways
+MIN_VIDEO_FLOOR_S = 8.0  # the minimum never asks for more than this (shorter is not worth publishing)
+TARGET_VIDEO_S = DEFAULT_TARGET_VIDEO_S
+MAX_VIDEO_S = TARGET_VIDEO_S + VIDEO_S_TOLERANCE                            # 20 s by default
+MIN_VIDEO_S = min(MIN_VIDEO_FLOOR_S, TARGET_VIDEO_S - VIDEO_S_TOLERANCE)    # 8 s by default
+# TARGET_VIDEO_S=0: the target is the source length (min/max follow it as for any target);
+# a video need not use every scene. MAX_SCENE_USES and MAX_SHARED_RATIO do not apply: several
+# videos about as long as the source cannot help sharing most scenes.
+FULL_SOURCE = False
 MAX_SCENE_USES = 2     # a scene may appear in at most this many videos
 MAX_SHARED_RATIO = 0.5 # shared scenes / scene count of the smaller video
 
@@ -110,12 +129,10 @@ NHIỆM VỤ: từ các scene này, lên kế hoạch cho NHIỀU video ngắn m
   để người xem không nhận ra chúng được dựng từ cùng một video.
 
 QUY TẮC BẮT BUỘC (sẽ được kiểm tra tự động):
-- Thời lượng mỗi video (tổng thời lượng các scene của nó) khoảng {target:.0f} giây,
-  KHÔNG dưới {min_s:.0f} giây và KHÔNG quá {max_s:.0f} giây. Hãy cộng thời lượng ở bảng trên cẩn thận.
+{length_rule}
 - Trong một video, mỗi scene xuất hiện tối đa một lần.
 {coverage_rule}
-- Một scene được dùng trong tối đa {max_uses} video.
-- Hai video bất kỳ dùng chung không quá {shared_pct}% số scene của video ngắn hơn.
+{reuse_rules}
 - Chỉ trả về scene_number theo thứ tự trong từng video. KHÔNG tự tính timestamp.
 - Giữ cạnh nhau những scene thuộc cùng một hành động/câu nói liên tục nếu tách ra sẽ vô nghĩa.
 - "key_points": 2-3 ý chính cụ thể (thông số, lợi ích, điểm khác biệt) mà lời thoại của video đó nên nói,
@@ -130,8 +147,8 @@ Kế hoạch vừa rồi vi phạm quy tắc:
 Hãy sửa lại và trả về TOÀN BỘ kế hoạch theo đúng schema, giữ các góc tiếp cận còn hợp lệ.
 Nếu một video quá ngắn vì góc của nó thiếu cảnh, hãy kết hợp thêm khía cạnh khác vào video đó
 hoặc gộp nó với video khác.
-Nhắc lại: mỗi video {min_s:.0f}-{max_s:.0f} giây (mục tiêu {target:.0f} giây), {count_fix}{coverage_fix}
-mỗi scene tối đa {max_uses} video, không lặp scene trong cùng một video.
+Nhắc lại: {length_fix}, {count_fix}{coverage_fix}
+{reuse_fix}không lặp scene trong cùng một video.
 """
 
 SCENE_ITEM = {
@@ -201,6 +218,42 @@ def target_videos() -> int | None:
     return value
 
 
+def video_length() -> None:
+    """TARGET_VIDEO_S from the environment (.env): target length of each video, in seconds.
+
+    Empty = DEFAULT_TARGET_VIDEO_S. Each video must then last between
+    min(MIN_VIDEO_FLOOR_S, target - VIDEO_S_TOLERANCE) and target + VIDEO_S_TOLERANCE
+    (15 -> 8..20 s, 10 -> 5..15 s, 30 -> 8..35 s).
+    0 = the source length (FULL_SOURCE): set by use_full_source once the scenes are loaded.
+    """
+    global TARGET_VIDEO_S, MAX_VIDEO_S, MIN_VIDEO_S, FULL_SOURCE
+    raw = os.environ.get("TARGET_VIDEO_S", "").strip()
+    try:
+        target = float(raw) if raw else DEFAULT_TARGET_VIDEO_S
+    except ValueError as exc:
+        raise ReorderError(f"TARGET_VIDEO_S must be a number of seconds: {raw!r}") from exc
+    if target == 0:
+        FULL_SOURCE = True
+        MAX_VIDEO_S = math.inf  # no limit until the source length is known
+        return
+    if not math.isfinite(target) or target - VIDEO_S_TOLERANCE < 1:
+        raise ReorderError(f"TARGET_VIDEO_S must be 0 (full source) or at least "
+                           f"{VIDEO_S_TOLERANCE + 1:.0f}: {raw!r}")
+    TARGET_VIDEO_S = target
+    MAX_VIDEO_S = target + VIDEO_S_TOLERANCE
+    MIN_VIDEO_S = min(MIN_VIDEO_FLOOR_S, target - VIDEO_S_TOLERANCE)
+
+
+def use_full_source(scenes: list[dict]) -> None:
+    """FULL_SOURCE: the target is the source length; minimum and maximum follow it as in
+    video_length (a source of 49 s -> 8..54 s; the maximum cannot be reached without
+    repeating a scene, so in practice a video lasts at most the source)."""
+    global TARGET_VIDEO_S, MAX_VIDEO_S, MIN_VIDEO_S
+    TARGET_VIDEO_S = sum(s["duration"] for s in scenes)
+    MAX_VIDEO_S = TARGET_VIDEO_S + VIDEO_S_TOLERANCE
+    MIN_VIDEO_S = max(1.0, min(MIN_VIDEO_FLOOR_S, TARGET_VIDEO_S - VIDEO_S_TOLERANCE))
+
+
 def log_error(error: Exception, script: str = "gemini_reorder") -> None:
     print(format_error(script, error), file=sys.stderr)
 
@@ -220,6 +273,11 @@ def video_policy(scenes: list[dict], target: int | None) -> dict:
     rule is dropped: Gemini picks the best scenes.
     """
     total = sum(s["duration"] for s in scenes)
+    if FULL_SOURCE:  # scenes may be reused freely: any count fits, nothing to lower or drop
+        return {"target": target, "count": target, "cover_all": True, "notes": [],
+                "count_rule": (f"- Tạo ĐÚNG {target} video (không hơn, không kém)." if target is not None
+                               else "- Số lượng video do bạn quyết định theo nội dung, tối thiểu 1 video."),
+                "count_fix": f"đúng {target} video, " if target is not None else ""}
     needed = min_videos(scenes)
     if target is None:
         return {"target": None, "count": None, "cover_all": True, "notes": [],
@@ -280,18 +338,27 @@ def rule_values(scenes: list[dict], policy: dict) -> dict:
         coverage_rule = ("- KHÔNG bắt buộc dùng hết các scene (video gốc dài hơn tổng thời lượng các video): "
                          "chọn những scene hay nhất cho từng góc tiếp cận.")
         coverage_fix = ""
-    return {
+    values = {
         "count": n,
         "count_rule": policy["count_rule"],
         "count_fix": policy["count_fix"],
+        "length_rule": (f"- Thời lượng mỗi video (tổng thời lượng các scene của nó) khoảng {TARGET_VIDEO_S:.0f} giây,\n"
+                        f"  KHÔNG dưới {MIN_VIDEO_S:.0f} giây và KHÔNG quá {MAX_VIDEO_S:.0f} giây. "
+                        "Hãy cộng thời lượng ở bảng trên cẩn thận."),
+        "length_fix": f"mỗi video {MIN_VIDEO_S:.0f}-{MAX_VIDEO_S:.0f} giây (mục tiêu {TARGET_VIDEO_S:.0f} giây)",
         "coverage_rule": coverage_rule,
         "coverage_fix": coverage_fix,
-        "target": TARGET_VIDEO_S,
-        "min_s": MIN_VIDEO_S,
-        "max_s": MAX_VIDEO_S,
-        "max_uses": MAX_SCENE_USES,
-        "shared_pct": round(MAX_SHARED_RATIO * 100),
+        "reuse_rules": (f"- Một scene được dùng trong tối đa {MAX_SCENE_USES} video.\n"
+                        f"- Hai video bất kỳ dùng chung không quá {round(MAX_SHARED_RATIO * 100)}% "
+                        "số scene của video ngắn hơn."),
+        "reuse_fix": f"mỗi scene tối đa {MAX_SCENE_USES} video, ",
     }
+    if FULL_SOURCE:  # videos about as long as the source cannot help sharing most scenes
+        values["reuse_rules"] = ("- Một scene được dùng trong bao nhiêu video cũng được, nhưng các video phải khác nhau "
+                                 "rõ rệt về lựa chọn và thứ tự scene, nhất là các scene mở đầu "
+                                 "(không có hai video giống hệt nhau).")
+        values["reuse_fix"] = "các video khác nhau về scene và thứ tự, "
+    return values
 
 
 def build_request(scenes: list[dict], clips_dir: Path, policy: dict) -> dict:
@@ -422,7 +489,7 @@ def find_problems(answer: dict, scenes: list[dict], policy: dict) -> list[str]:
     unused = [n for n, where in uses.items() if not where]
     if unused and policy["cover_all"]:
         problems.append(f"Scene chưa được dùng ở video nào: {unused}.")
-    overused = {n: where for n, where in uses.items() if len(where) > MAX_SCENE_USES}
+    overused = {} if FULL_SOURCE else {n: where for n, where in uses.items() if len(where) > MAX_SCENE_USES}
     for n, where in overused.items():
         problems.append(f"Scene {n} dùng trong {len(where)} video {where}, tối đa {MAX_SCENE_USES}.")
 
@@ -432,8 +499,8 @@ def find_problems(answer: dict, scenes: list[dict], policy: dict) -> list[str]:
         shared = set(plan_a) & set(plan_b)
         smaller = min(len(set(plan_a)), len(set(plan_b)))
         if plan_a == plan_b:
-            problems.append(f"Video {a} và {b} giống hệt nhau.")
-        elif len(shared) > MAX_SHARED_RATIO * smaller:
+            problems.append(f"Video {a} và {b} giống hệt nhau (cùng scene, cùng thứ tự).")
+        elif not FULL_SOURCE and len(shared) > MAX_SHARED_RATIO * smaller:
             problems.append(
                 f"Video {a} và {b} dùng chung {len(shared)}/{smaller} scene "
                 f"(tối đa {round(MAX_SHARED_RATIO * 100)}%): {sorted(shared)}."
@@ -481,11 +548,12 @@ def build_output(answer: dict, scenes: list[dict], model: str, policy: dict) -> 
         "product": answer.get("product", ""),
         "aspects": answer.get("aspects", []),
         "rules": {
-            "target_video_s": TARGET_VIDEO_S,
-            "max_video_s": MAX_VIDEO_S,
-            "min_video_s": MIN_VIDEO_S,
-            "max_scene_uses": MAX_SCENE_USES,
-            "max_shared_ratio": MAX_SHARED_RATIO,
+            "full_source": FULL_SOURCE,
+            "target_video_s": round(TARGET_VIDEO_S, 3),
+            "max_video_s": round(MAX_VIDEO_S, 3),
+            "min_video_s": round(MIN_VIDEO_S, 3),
+            "max_scene_uses": None if FULL_SOURCE else MAX_SCENE_USES,
+            "max_shared_ratio": None if FULL_SOURCE else MAX_SHARED_RATIO,
             "target_videos": policy["target"],
             "videos_required": policy["count"],
             "all_scenes_used_required": policy["cover_all"],
@@ -497,6 +565,67 @@ def build_output(answer: dict, scenes: list[dict], model: str, policy: dict) -> 
         "videos": videos,
         "scene_usage": {str(n): where for n, where in usage.items()},
     }
+
+
+MIN_RUN_SCENES = 2  # shortest run of consecutive scenes worth reporting
+
+
+def find_overlaps(videos: list[dict]) -> dict:
+    """Runs of consecutive scenes (same scenes, same order) shared by two or more videos.
+
+    For every pair of videos, each maximal common run of at least MIN_RUN_SCENES scenes,
+    e.g. [1, 2, 3, 4, 9] and [7, 2, 3, 4, 19] share the run 2-3-4. The same run found in
+    several pairs is reported once with every video that has it (videos 1, 2, 3 sharing
+    2-3-4 -> one run, videos [1, 2, 3]). Seconds are the sum of the run's scene durations.
+    Per video: seconds covered by any shared run, each scene counted once.
+    """
+    plans = {v["video_index"]: [s["scene_number"] for s in v["scenes"]] for v in videos}
+    durations = {s["scene_number"]: s["duration"] for v in videos for s in v["scenes"]}
+    runs: dict[tuple, set] = {}  # scenes of a run -> videos that have it (first found first)
+    shared = {index: set() for index in plans}
+    for (a, plan_a), (b, plan_b) in combinations(plans.items(), 2):
+        position_b = {n: j for j, n in enumerate(plan_b)}  # a scene appears once per video
+        i = 0
+        while i < len(plan_a):
+            j = position_b.get(plan_a[i])
+            length = 0
+            while j is not None and i + length < len(plan_a) and j + length < len(plan_b) \
+                    and plan_a[i + length] == plan_b[j + length]:
+                length += 1
+            if length >= MIN_RUN_SCENES:
+                scenes = plan_a[i:i + length]
+                runs.setdefault(tuple(scenes), set()).update((a, b))
+                shared[a].update(scenes)
+                shared[b].update(scenes)
+            i += max(length, 1)
+    per_video = []
+    for v in videos:
+        seconds = sum(durations[n] for n in shared[v["video_index"]])
+        per_video.append({"video_index": v["video_index"], "shared_seconds": round(seconds, 3),
+                          "total_duration": v["total_duration"],
+                          "shared_ratio": round(seconds / v["total_duration"], 3) if v["total_duration"] else 0.0})
+    return {"min_run_scenes": MIN_RUN_SCENES,
+            "runs": [{"videos": sorted(where), "scenes": list(scenes),
+                      "seconds": round(sum(durations[n] for n in scenes), 3)}
+                     for scenes, where in runs.items()],
+            "per_video": per_video}
+
+
+def overlap_lines(overlaps: dict) -> list[str]:
+    """Stdout lines describing find_overlaps, one fact per line, easy to parse:
+
+        overlap:<videos joined by _>-<scene numbers joined by _>-<seconds>
+            one line per distinct shared run, with every video (2 or more, ascending) that
+            has it, e.g. 'overlap:1_2-6_7_8_9-3.670', 'overlap:1_2_3_4-2_3_4-3.000'
+        overlap_video:<video>-<shared seconds>_<video seconds>
+            one line per video, always printed (0.000 = shares nothing), e.g. 'overlap_video:1-28.580_45.100'
+    """
+    # 3 decimals, like stats.json, so a parser gets the same numbers as the file.
+    lines = [f"overlap:{'_'.join(map(str, r['videos']))}-{'_'.join(map(str, r['scenes']))}-{r['seconds']:.3f}"
+             for r in overlaps["runs"]]
+    lines += [f"overlap_video:{p['video_index']}-{p['shared_seconds']:.3f}_{p['total_duration']:.3f}"
+              for p in overlaps["per_video"]]
+    return lines
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -567,7 +696,14 @@ def main() -> int:
     try:
         if output in (request_file, response_file):
             raise ReorderError(f"output_json must not be named {output.name}")
+        video_length()  # before load_scenes: it checks scenes against MAX_VIDEO_S
         scenes = load_scenes(scenelog)
+        if FULL_SOURCE:
+            use_full_source(scenes)
+            log(f"Video length: target = source {TARGET_VIDEO_S:.1f}s ({MIN_VIDEO_S:g}-{MAX_VIDEO_S:.1f}s), "
+                "scenes may be reused freely")
+        else:
+            log(f"Video length: target {TARGET_VIDEO_S:g}s ({MIN_VIDEO_S:g}-{MAX_VIDEO_S:g}s)")
         policy = video_policy(scenes, target_videos())
         for note in policy["notes"]:
             log(f"REORDER_TARGET_VIDEOS: {note}")
@@ -583,14 +719,18 @@ def main() -> int:
         if not api_key or api_key == KEY_PLACEHOLDER:
             raise ReorderError("GEMINI_API_KEY is not set (fill it in .env, then recreate the container)", E_AUTH)
 
-        # Drop results of a previous run so the three files always belong together.
+        # Drop results of a previous run so the files always belong together.
         output.unlink(missing_ok=True)
         response_file.unlink(missing_ok=True)
+        stats_file = stats_path(output.parent)
+        update_stats(stats_file, "overlaps", None)
 
         answer = plan_videos(body, scenes, model, api_key, response_file, policy)
         result = build_output(answer, scenes, model, policy)
         log(", ".join(f"video {v['video_index']}: {v['total_duration']:.1f}s" for v in result["videos"]))
+        overlaps = find_overlaps(result["videos"])
         write_json(output, result)
+        update_stats(stats_file, "overlaps", overlaps)
     except ReorderError as exc:
         log_error(exc)
         print("fail")
@@ -600,7 +740,9 @@ def main() -> int:
         print("fail")
         return 1
 
-    print(f"json:{output}")
+    print(f"json:{output}")  # always the first line: n8n reads it with /^json:(.*)$/m
+    for line in overlap_lines(overlaps):
+        print(line)
     return 0
 
 

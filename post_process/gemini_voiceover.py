@@ -22,6 +22,9 @@ conversation) to fix, up to ANSWER_ATTEMPTS times:
     - spoken length fits the video: TARGET_FILL of duration x --rate syllables,
       between MIN_FILL and MAX_FILL
     - every segment's text fits a subtitle line (MAX_SEGMENT_CHARS)
+    - every segment's spoken says exactly its text (spoken_mismatch): only numbers,
+      symbols, abbreviations and foreign words may be written differently; a Vietnamese
+      word changed, dropped or added means the voice says something the subtitle does not
     - no empty segment
 
 Style: energetic sales voice, "mình" (speaker) - "bạn" (viewer).
@@ -41,10 +44,12 @@ Exit code: 0 for success, 1 for failure.
 
 import argparse
 import base64
+import difflib
 import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 try:  # python -m post_process.gemini_voiceover
@@ -96,9 +101,11 @@ QUY TẮC BẮT BUỘC (sẽ được kiểm tra tự động):
 - Chia lời thoại thành các đoạn ngắn để làm phụ đề: mỗi "text" tối đa {max_chars} ký tự,
   ngắt ở chỗ ngắt hơi tự nhiên, không cắt giữa một cụm từ.
 - "text": dạng hiển thị phụ đề, viết số và đơn vị gọn (4,7g, -56dB, LDAC).
-- "spoken": đúng nội dung của "text" nhưng viết ra đúng như sẽ đọc: số, ký hiệu, đơn vị và chữ viết tắt
-  viết thành chữ tiếng Việt (ví dụ "4,7g" -> "bốn phẩy bảy gam", "-56dB" -> "âm năm mươi sáu đề xi ben",
+- "spoken": CHÍNH XÁC từng chữ của "text", chỉ khác ở chỗ số, ký hiệu, đơn vị, chữ viết tắt và từ nước ngoài
+  được viết ra đúng như sẽ đọc (ví dụ "4,7g" -> "bốn phẩy bảy gam", "-56dB" -> "âm năm mươi sáu đề xi ben",
   "ANC" -> "a en xê"). Tên thương hiệu đọc theo cách người Việt hay đọc.
+  KHÔNG thêm, bớt hay đổi bất kỳ chữ tiếng Việt nào: người xem nghe "spoken" và đọc "text" cùng lúc,
+  khác một chữ là lệch. Cần dài hơn thì viết thêm đoạn mới, không kéo dài "spoken".
 - Chỉ dùng thông tin có trong video (hình, chữ, lời nói). Không bịa thông số, không hứa hẹn quá mức.
 - Không nêu giá bằng tệ/nhân dân tệ hay quy đổi tiền; có thể nói chung kiểu "giá cực mềm".
 - "tts_style": một câu tiếng Anh mô tả cách đọc cho máy đọc (Gemini TTS), ví dụ
@@ -110,7 +117,8 @@ Lời thoại vừa rồi chưa đạt:
 {problems}
 
 Hãy sửa lại và trả về TOÀN BỘ lời thoại theo đúng schema. Nhắc lại: tổng "spoken" khoảng {target} âm tiết
-(từ {min_syl} đến {max_syl}), mỗi "text" tối đa {max_chars} ký tự.
+(từ {min_syl} đến {max_syl}), mỗi "text" tối đa {max_chars} ký tự, và "spoken" giữ đúng từng chữ tiếng Việt
+của "text" (chỉ số, ký hiệu, viết tắt, từ nước ngoài được viết thành cách đọc).
 """
 
 RESPONSE_SCHEMA = {
@@ -142,6 +150,29 @@ def log(message: str) -> None:
 def syllables(text: str) -> int:
     """Vietnamese syllables ~ space-separated words that contain a letter or digit."""
     return sum(1 for word in text.split() if re.search(r"\w", word))
+
+
+def words(text: str) -> list[str]:
+    return re.findall(r"\w+", unicodedata.normalize("NFC", text).lower())
+
+
+def spoken_mismatch(text: str, spoken: str) -> list[str]:
+    """How spoken differs from text in content, as readable notes; [] when it says the same.
+
+    The two are aligned word by word. Allowed: a text word written another way in spoken
+    when the text word is plain ASCII (a number, unit, abbreviation, brand or foreign word:
+    "360" -> "ba trăm sáu mươi", "retro" -> "re-tro"). Not allowed: spoken words added where
+    the text has nothing, and a Vietnamese word (with diacritics) changed or dropped. A plain
+    Vietnamese word without diacritics ("hay", "tai") replaced by another is not caught."""
+    t, s = words(text), words(spoken)
+    notes = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, t, s, autojunk=False).get_opcodes():
+        if op == "insert":
+            notes.append(f"thừa \"{' '.join(s[j1:j2])}\"")
+        elif op in ("delete", "replace") and any(not w.isascii() for w in t[i1:i2]):
+            said = " ".join(s[j1:j2])
+            notes.append(f"\"{' '.join(t[i1:i2])}\" " + (f"thành \"{said}\"" if said else "bị bỏ"))
+    return notes
 
 
 def budget(duration: float, rate: float) -> dict:
@@ -205,8 +236,13 @@ def find_problems(answer: dict, limits: dict) -> list[str]:
         spoken = str(seg.get("spoken", "")).strip() if isinstance(seg, dict) else ""
         if not text or not spoken:
             problems.append(f"Đoạn {i}: thiếu 'text' hoặc 'spoken'.")
-        elif len(text) > limits["max_chars"]:
-            problems.append(f"Đoạn {i}: \"{text}\" dài {len(text)} ký tự, tối đa {limits['max_chars']}.")
+        else:
+            if len(text) > limits["max_chars"]:
+                problems.append(f"Đoạn {i}: \"{text}\" dài {len(text)} ký tự, tối đa {limits['max_chars']}.")
+            notes = spoken_mismatch(text, spoken)
+            if notes:
+                problems.append(f"Đoạn {i}: \"spoken\" khác \"text\" ({'; '.join(notes)}). "
+                                f"\"spoken\" phải đọc đúng từng chữ của \"text\".")
     total = sum(syllables(str(s.get("spoken", ""))) for s in segments if isinstance(s, dict))
     if total < limits["min_syl"]:
         problems.append(f"Lời thoại chỉ có {total} âm tiết, quá ngắn (tối thiểu {limits['min_syl']}).")

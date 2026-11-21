@@ -83,7 +83,7 @@
     },
     {
       "parameters": {
-        "command": "=uv run python -m post_process.compress_clips \"{{ $json.stdout.trim().replace(/^dir:/, '') }}\" \"{{ $json.stdout.trim().replace(/^dir:/, '').replace(/\\/sources$/, '/compressed') }}\""
+        "command": "=uv run python -m post_process.compress_clips \"{{ $json.stdout.match(/^dir:(.*)$/m)[1].trim() }}\" \"{{ $json.stdout.match(/^dir:(.*)$/m)[1].trim().replace(/\\/sources$/, '/compressed') }}\""
       },
       "type": "n8n-nodes-base.executeCommand",
       "typeVersion": 1,
@@ -109,7 +109,7 @@
     },
     {
       "parameters": {
-        "command": "=python -m post_process.remove_captions \"{{ $json.stdout.trim().replace(/^json:/, '').replace(/\\/reorder\\.json$/, '/sources') }}\" \"{{ $json.stdout.trim().replace(/^json:/, '').replace(/\\/reorder\\.json$/, '/clean') }}\""
+        "command": "=python -m post_process.remove_captions \"{{ $json.stdout.match(/^json:(.*)$/m)[1].trim().replace(/\\/reorder\\.json$/, '/sources') }}\" \"{{ $json.stdout.match(/^json:(.*)$/m)[1].trim().replace(/\\/reorder\\.json$/, '/clean') }}\""
       },
       "type": "n8n-nodes-base.executeCommand",
       "typeVersion": 1,

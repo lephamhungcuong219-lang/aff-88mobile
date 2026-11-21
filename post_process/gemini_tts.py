@@ -10,9 +10,9 @@ ONE request per video: all lines of the video are read in a single TTS call, so 
 intonation flows naturally and the daily request limit goes ~7x further. Per video:
   1. send every segments[].spoken joined with a pause between lines, plus the
      video's "tts_style" and a fixed accent instruction (Southern Vietnamese)
-  2. find the line boundaries: the pauses between lines are the longest silences
-     close to where they are expected (expected = position by syllable count);
-     if that does not give believable lines, split by syllable count instead
+  2. find the line boundaries: the set of silences that together gives the longest
+     pauses and the most even reading pace across the lines (see best_breaks);
+     if no set gives believable lines, split by syllable count instead
      ("split" in tts.json says which was used)
   3. trim the silence around the speech, start after LEAD seconds
   4. fit the video so there is no silent ending: a track that ends early gets longer
@@ -64,6 +64,7 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import random
 import re
@@ -105,8 +106,12 @@ DEFAULT_RPM = 10          # requests per minute allowed per TTS model (Tier 1); 
 BAD_AUDIO_RETRIES = 1     # re-ask the same model when the audio looks wrong (skipped/repeated text)
 
 SILENCE_DB = -40.0        # below this a 10 ms frame counts as silence
-MIN_PAUSE_S = 0.06        # shorter silences are not line breaks
+MIN_PAUSE_S = 0.01        # shortest silence considered as a line break. Kept tiny on purpose: TTS often
+                          # runs two lines together (no comma at the end of the first), and a line break
+                          # missing from the candidates makes the split take a breath elsewhere and shift
+                          # every line in between; best_breaks still prefers long pauses (PAUSE_WEIGHT)
 MIN_LINE_S = 0.25         # a split line shorter than this means the split is wrong
+PAUSE_WEIGHT = 4.0        # line split: worth of 1 s of pause at a break vs an uneven reading pace
 LINE_RATE_RANGE = (2.0, 9.5)   # syllables per second of a believable line
 TRACK_RATE_RANGE = (2.0, 8.5)  # of the whole track (outside: text skipped or repeated)
 KEEP_EDGE_S = 0.04        # silence kept around the speech when trimming
@@ -270,20 +275,59 @@ def split_lines(samples: np.ndarray, counts: list[int]) -> tuple[float, float, l
     expected = [start + (end - start) * sum(counts[:k]) / total for k in range(1, len(counts))]
     proportional = list(zip([start] + expected, expected + [end]))
 
-    chosen, after = [], start
-    for target in expected:
-        candidates = [r for r in runs if r[0] > after]
-        if not candidates:
-            return start, end, proportional, "proportional"
-        best = min(candidates, key=lambda r: abs((r[0] + r[1]) / 2 - target))
-        chosen.append(best)
-        after = best[1]
+    chosen = best_breaks(runs, counts, start, end)
+    if chosen is None:
+        return start, end, proportional, "proportional"
     bounds = list(zip([start] + [b for _, b in chosen], [a for a, _ in chosen] + [end]))
-    for (a, b), n in zip(bounds, counts):
-        length = b - a
-        if length < MIN_LINE_S or not LINE_RATE_RANGE[0] <= n / length <= LINE_RATE_RANGE[1]:
-            return start, end, proportional, "proportional"
     return start, end, bounds, "silence"
+
+
+def best_breaks(runs: list[tuple[float, float]], counts: list[int], start: float,
+                end: float) -> list[tuple[float, float]] | None:
+    """The len(counts)-1 silent runs that best split the speech into the lines, or None.
+
+    Chosen together (dynamic programming), not one by one: picking each break nearest to
+    its syllable-count estimate often took a short breath inside a sentence instead of the
+    real pause after it, and every later subtitle then came early. The best set has long
+    pauses (PAUSE_WEIGHT per second) and lines read at an even pace (cost: distance of each
+    line's syllable rate from the track's, on a log scale). Every line must stay believable
+    (MIN_LINE_S, LINE_RATE_RANGE)."""
+    k_breaks, n_runs = len(counts) - 1, len(runs)
+    if n_runs < k_breaks:
+        return None
+    rate = sum(counts) / max(end - start, 1e-6)
+
+    def line_cost(syllable_count: int, a: float, b: float) -> float:
+        length = b - a
+        if length < MIN_LINE_S or not LINE_RATE_RANGE[0] <= syllable_count / length <= LINE_RATE_RANGE[1]:
+            return math.inf
+        return abs(math.log(syllable_count / length / rate))
+
+    pause = [PAUSE_WEIGHT * (b - a) for a, b in runs]
+    # cost[j]: best cost with the current break at run j; back[k][j]: run of the previous break.
+    cost = [line_cost(counts[0], start, a) - pause[j] for j, (a, _) in enumerate(runs)]
+    back: list[list[int]] = []
+    for k in range(1, k_breaks):
+        new, prev = [math.inf] * n_runs, [-1] * n_runs
+        for j in range(k, n_runs):
+            a = runs[j][0]
+            for i in range(k - 1, j):
+                if cost[i] == math.inf:
+                    continue
+                c = cost[i] + line_cost(counts[k], runs[i][1], a) - pause[j]
+                if c < new[j]:
+                    new[j], prev[j] = c, i
+        cost = new
+        back.append(prev)
+    final = [c + line_cost(counts[-1], runs[j][1], end) for j, c in enumerate(cost)]
+    j = min(range(n_runs), key=final.__getitem__)
+    if final[j] == math.inf:
+        return None
+    path = [j]
+    for prev in reversed(back):
+        j = prev[j]
+        path.append(j)
+    return [runs[i] for i in reversed(path)]
 
 
 def quietest_point(samples: np.ndarray, a: float, b: float) -> int:
