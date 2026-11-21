@@ -61,6 +61,7 @@ services:
 
       # Enable Execute Command
       NODES_EXCLUDE: "[]"
+      NODE_FUNCTION_ALLOW_BUILTIN: "fs,path"
 
       # Task runner: giữ hành vi hiện tại, chỉ ghi rõ để tắt cảnh báo deprecation
       N8N_RUNNERS_TASK_TIMEOUT: "300"
@@ -110,6 +111,25 @@ services:
     networks:
       - n8n-network
 
+  # Trang xem / tải / xoá video final của job: ?id=<workflowId>-<runId>
+  #   VPS (Caddy):  https://preview.<N8N_HOST>/?id=...
+  #   Local:        http://localhost:3000/?id=...
+  # CHƯA CÓ ĐĂNG NHẬP: ai có link đều xem và xoá được.
+  media-viewer:
+    depends_on:
+      init-dirs:
+        condition: service_completed_successfully
+    build:
+      context: ./apps/media-viewer
+    container_name: n8n-media-viewer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./media:/data/media
+    networks:
+      - n8n-network
+
   # Reverse proxy + HTTPS tự động (Let's Encrypt). Chỉ chạy khi COMPOSE_PROFILES=proxy (trên VPS).
   caddy:
     image: caddy:2-alpine
@@ -120,6 +140,8 @@ services:
     depends_on:
       n8n:
         condition: service_healthy
+      media-viewer:
+        condition: service_started
 
     ports:
       - "80:80"

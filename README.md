@@ -4,11 +4,15 @@ n8n (kèm ffmpeg, bật Execute Command) chạy bằng Docker, dùng Supabase Po
 Trên VPS có Caddy làm reverse proxy và tự cấp HTTPS (Let's Encrypt).
 
 ```
-Internet ──443──> Caddy ──> n8n:5678 ──SSL──> Supabase Postgres (schema n8n)
-                              │
-                              ├── ./n8n_data  -> /home/node/.n8n
-                              └── ./media     -> /data/media   (file cho ffmpeg)
+Internet ──443──> Caddy ─┬─ <N8N_HOST>         ──> n8n:5678 ──SSL──> Supabase Postgres (schema n8n)
+                         │                            │
+                         │                            ├── ./n8n_data  -> /home/node/.n8n
+                         │                            └── ./media     -> /data/media   (file cho ffmpeg)
+                         └─ preview.<N8N_HOST> ──> media-viewer:3000 (đọc/xoá ./media/jobs)
 ```
+
+Trang xem video final của một job: `https://preview.<N8N_HOST>/?id=<workflowId>-<runId>`
+(local: http://localhost:3000/?id=...). Chi tiết ở [apps/media-viewer](apps/media-viewer/README.md).
 
 ## Chạy local
 
@@ -24,7 +28,8 @@ Mở http://localhost:5678
 
 ### 1. Chuẩn bị
 - VPS tối thiểu 2 vCPU / 2 GB RAM (ffmpeg cần thêm).
-- Trỏ **A record** của domain (ví dụ `n8n.example.com`) về IP của VPS.
+- Trỏ **A record** của domain (ví dụ `n8n.example.com`) **và `preview.n8n.example.com`** về IP của VPS
+  (hoặc một wildcard `*.n8n.example.com`). Caddy tự lấy chứng chỉ cho cả hai.
 - Nên chọn VPS ở **cùng region với Supabase** (hiện tại là `eu-west-1`, Ireland) để giảm độ trễ DB.
 
 ### 2. Cài Docker và mở firewall

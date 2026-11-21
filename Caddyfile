@@ -6,3 +6,12 @@
 		flush_interval -1
 	}
 }
+
+# Trang xem / tải / xoá video final: https://preview.<N8N_HOST>/?id=<workflowId>-<runId>
+# Cần bản ghi DNS cho preview.<N8N_HOST> (A record về IP VPS, hoặc wildcard *.<N8N_HOST>).
+preview.{$N8N_HOST} {
+	# Mặc định Caddy chỉ nén text/json/js/css..., không nén video.
+	encode zstd gzip
+
+	reverse_proxy media-viewer:3000
+}

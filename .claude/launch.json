@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "media-viewer",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "apps/media-viewer", "start"],
+      "port": 3000
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# Workspace riêng của app (tách khỏi workspace n8n ở thư mục gốc).
+allowBuilds:
+  esbuild: true
