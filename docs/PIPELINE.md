@@ -87,8 +87,8 @@ Bước 6 không phụ thuộc bước 4-5: có thể chạy ngay sau bước 3 
     └── <awemeId>/
         ├── sources/<N>.mp4           các cảnh, chất lượng gốc, còn caption    [3]
         ├── scenelog.csv / .json      danh sách cảnh + thời gian               [3]
-        ├── stats.json                thống kê: long_scenes [3], overlaps [5]
-        ├── runlog.txt                log của scenedetect                      [3]
+        ├── stats.json                thống kê: long_scenes, scene_detection [3], overlaps, source_overlaps [5]
+        ├── runlog.txt                kết quả dò cảnh của hai bộ dò             [3]
         ├── compressed/<N>.mp4        bản nhỏ 480p có nhãn SCENE N             [4]
         ├── request.json              request gửi Gemini (lên kế hoạch)        [5]
         ├── gem_response.json         response gốc của Gemini                  [5]
@@ -139,7 +139,21 @@ Link Douyin có chữ ký và hết hạn sau một thời gian: chạy ngay sau
 
 ### 3. split_video
 
-Cắt video thành các cảnh bằng PySceneDetect, đặt tên `1.mp4`, `2.mp4`… và xuất danh sách cảnh.
+Cắt video thành các cảnh bằng **hai bộ dò gộp lại**, đặt tên `1.mp4`, `2.mp4`… và xuất danh sách cảnh.
+
+- **PySceneDetect** (`AdaptiveDetector`): cắt đột ngột cách nhau từ 0,6 giây.
+- **OpenCV** (`scene_cuts.py`): cắt đột ngột mà PySceneDetect bỏ vì quá gần nhau, và **chuyển mờ** (cross-dissolve: khung ở
+  giữa là hỗn hợp của khung trước và khung sau; máy lia hay vật chuyển động thì không).
+
+Lấy **hợp** của hai bên, không chọn bên nhiều cảnh hơn (bộ dò quá nhạy cũng ra nhiều cảnh vì cắt vụn một cảnh).
+Các khung đang chuyển mờ bị bỏ, không thuộc cảnh nào, nên cảnh không còn bóng của cảnh khác; giữa hai cảnh liền nhau có thể có
+khoảng trống. OpenCV không tạo cảnh ngắn hơn 0,5 giây; mẩu thừa dưới 0,5 giây cạnh đoạn chuyển mờ bị bỏ.
+
+**Cảnh quay liền quá dài:** cảnh vẫn dài hơn `SCENE_MAX_S` (mặc định **2.9** giây; 0 = không chia) được chia **đều** thành ít phần nhất,
+mỗi phần không quá `SCENE_PART_S` (mặc định **1.45**); được bỏ tối đa `SCENE_TRIM_S` (mặc định **0.3**) giây cuối cảnh nếu nhờ vậy bớt
+được một phần: 3,1s → 2 × 1,45 (bỏ 0,2s); 5,5s → 4 × 1,375; 10s → 7 × 1,43. Các phần là những cảnh riêng, đánh số liền nhau. Hai phần
+cạnh nhau không quá 2 × `SCENE_PART_S` = 2,9s nên Gemini được ghép liền hay tách ra; ba phần liền nhau quá
+`REORDER_SOURCE_RUN_MAX_S` thì bị từ chối ở bước 5.
 
 | | |
 |---|---|
@@ -196,7 +210,7 @@ tiếp cận riêng. Gemini chỉ trả về thứ tự cảnh; script kiểm tr
 | Input | `scenelog_json`: `.../scenelog.json`; `clips_dir`: `.../compressed`; `output_json`: `.../reorder.json` |
 | Môi trường | `GEMINI_API_KEY` (bắt buộc), `GEMINI_MODEL` (mặc định `gemini-3.8-flash`) |
 | Output | `request.json` (request gửi đi), `gem_response.json` (response mọi lần gọi), `reorder.json` (chỉ khi thành công) — cùng thư mục |
-| stdout | `json:<reorder.json>` rồi các dòng `overlap:`, `overlap_video:` / `fail` (`--dry-run`: chỉ ghi `request.json`, stdout `json:<request.json>`) |
+| stdout | `json:<reorder.json>` rồi các dòng `overlap:`, `overlap_video:`, `source_overlap:`, `source_overlap_video:` / `fail` (`--dry-run`: chỉ ghi `request.json`, stdout `json:<request.json>`) |
 
 **Kiểm tra đoạn trùng:** sau khi có kế hoạch hợp lệ, script tìm các đoạn **từ 2 cảnh liên tiếp trở lên** (cùng cảnh,
 cùng thứ tự) xuất hiện ở từ hai video trở lên, ví dụ video 1 `1,2,3,4,9` và video 2 `7,2,3,4,19` trùng đoạn `2-3-4`.
@@ -216,42 +230,75 @@ overlap_video:4-1.733_4.366     (video không trùng gì: 0.000_...)
 Không có đoạn trùng nào thì không có dòng `overlap:`, các dòng `overlap_video:` đều là `0.000`.
 Đây chỉ là thống kê, không làm job thất bại.
 
+**So với video gốc:** các cảnh có số liền nhau (`n, n+1, …`) đặt cạnh nhau trong một video output là một đoạn giống hệt video
+gốc. Mỗi đoạn **từ 2 cảnh trở lên** (và mỗi cảnh đơn dài hơn `REORDER_SOURCE_RUN_MAX_S`) một dòng `source_overlap:`, rồi mỗi video một
+dòng `source_overlap_video:`:
+```
+source_overlap:<video>-<các cảnh, nối bằng _>-<số giây>
+source_overlap_video:<video>-<số giây nằm trong các đoạn>_<thời lượng video>_<đoạn dài nhất, kể cả cảnh đơn>
+
+source_overlap:1-4_5-2.833
+source_overlap_video:1-2.833_17.466_2.833
+source_overlap_video:2-0.000_15.633_2.300
+```
+Trong `stats.json` → `source_overlaps` có thêm: `level` của từng đoạn (`ok` / `above_target`: trên mức mục tiêu / `too_long`: quá mức
+tối đa, chỉ có thể là cảnh đơn), `longest_scenes`, và `source_used_ratio` (video dùng bao nhiêu phần thời lượng video gốc, thứ tự bất kỳ).
+
 **`stats.json`** (`temp/<awemeId>/stats.json`, module `job_stats.py`): bản đầy đủ của các thống kê trên stdout, để xem
 lại sau. `split_video` tạo mới file với khóa `long_scenes` (thêm `durations`, `long_seconds`, `total_seconds`);
-`gemini_reorder` thêm khóa `overlaps` (`runs`, `per_video` có `shared_ratio`), xoá khóa này khi bắt đầu chạy lại.
+và `scene_detection` (số cảnh của PySceneDetect, điểm cắt OpenCV thêm vào, các đoạn chuyển mờ,
+cảnh dài đã chia);
+`gemini_reorder` thêm khóa `overlaps` (`runs`, `per_video` có `shared_ratio`) và `source_overlaps` (so từng video output với
+video gốc), xoá hai khóa này khi bắt đầu chạy lại.
 
 Gom stdout của cả hai bước thành một JSON trong n8n: Code node [flows/code/job_stats.js](../flows/code/job_stats.js)
 (cấu trúc giống `stats.json`). Đặt ở nhánh riêng, không chèn giữa chuỗi node.
 
 **Gửi thống kê lên Discord** (công cụ cho người phát triển, không phải tính năng): nhánh riêng từ node "Nấu các cảnh"
 → Code node [flows/code/discord_stats.js](../flows/code/discord_stats.js) (mode "Run Once for Each Item") đọc
-`stats.json` + `reorder.json`, trả về `content` (tin nhắn ≤ 2000 ký tự: cảnh dài, % trùng từng video, các đoạn trùng)
+`stats.json` + `reorder.json`, trả về `content` (tin nhắn ≤ 2000 ký tự: cảnh dài, % trùng từng video, các đoạn trùng, phần trùng với video gốc)
 và `color` (xanh < 20% trùng, vàng < 50%, đỏ ≥ 50%) → node Discord gửi `{{ $json.content }}`.
 
 **Số video đầu ra:** `REORDER_TARGET_VIDEOS` trong `.env` (hiện là **4**) = tạo đúng N video; để trống = Gemini tự quyết
 (tối thiểu đủ để dùng hết các cảnh). N được hạ xuống khi video gốc quá ngắn (cần ít nhất thời lượng tối thiểu mỗi video,
-mỗi cảnh dùng tối đa 2 lần). Khi N video × thời lượng tối đa không chứa hết video gốc (video gốc dài), vẫn giữ N video và
+mỗi cảnh dùng tối đa `REORDER_MAX_SCENE_USES` lần, cảnh dài hơn `REORDER_MAX_SHARED_RUN_S` chỉ một lần). Khi N video × thời lượng tối đa không chứa hết video gốc (video gốc dài), vẫn giữ N video và
 **bỏ quy tắc dùng hết các cảnh** (Gemini chọn cảnh hay nhất). Các điều chỉnh này ghi trong `reorder.json` → `rules.notes`.
 
 **Thời lượng mỗi video:** `TARGET_VIDEO_S` trong `.env` (mặc định **15**). Khoảng cho phép đi theo mục tiêu:
-tối đa = mục tiêu + 5 giây, tối thiểu = min(8, mục tiêu − 5) giây. Ví dụ 15 → 8-20s, 10 → 5-15s, 30 → 8-35s.
+tối đa = mục tiêu + 5 giây, tối thiểu = mục tiêu − 5 giây. Ví dụ 15 → 10-20s, 10 → 5-15s, 30 → 25-35s.
 Mục tiêu phải từ 6 giây trở lên, hoặc **0 = mục tiêu là độ dài video gốc**: khoảng cho phép theo cùng công thức (gốc 49s →
-8-54s; thực tế không quá độ dài gốc vì một video không lặp cảnh), không bắt mỗi video dùng đủ mọi cảnh; khi đó bỏ hai
-quy tắc "mỗi cảnh tối đa 2 video" và "dùng chung tối đa 50%" (chỉ cấm hai video giống hệt nhau), số video
+44-54s; thực tế không quá độ dài gốc vì một video không lặp cảnh), không bắt mỗi video dùng đủ mọi cảnh; khi đó bỏ các
+quy tắc dùng lại cảnh bên dưới (chỉ cấm hai video giống hệt nhau), số video
 `REORDER_TARGET_VIDEOS` được giữ nguyên, không bị hạ. Giá trị dùng thực tế ghi trong `reorder.json` → `rules`
 (`full_source`, `target_video_s`, `min_video_s`, `max_video_s`).
+
+**Dùng lại cảnh giữa các video** (`.env`, giá trị dùng thực tế ở `rules` → `max_scene_uses`, `max_shared_ratio`, `max_shared_run_s`):
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `REORDER_MAX_SCENE_USES` | 2 | một cảnh dùng trong tối đa bao nhiêu video (luôn bắt buộc) |
+| `REORDER_MAX_SHARED_PERCENT` | 50 | độ đa dạng: hai video dùng chung tối đa bao nhiêu % số cảnh của video ngắn hơn; 100 = không giới hạn |
+| `REORDER_MAX_SHARED_RUN_S` | 3 | mỗi đoạn trùng giữa hai video dài tối đa bao nhiêu giây, **luôn áp dụng** dù dùng chung nhiều hay ít; 0 = không giới hạn |
+| `REORDER_SOURCE_RUN_TARGET_S` | 2.7 | trùng với **video gốc**: Gemini được yêu cầu giữ mỗi đoạn cảnh số liền nhau (1, 2, 3…) đặt cạnh nhau dưới mức này |
+| `REORDER_SOURCE_RUN_MAX_S` | 2.9 | mức tối đa chấp nhận của đoạn đó (từ 2 cảnh trở lên), quá thì Gemini phải sửa; áp dụng cả khi `TARGET_VIDEO_S=0`; 0 = không giới hạn |
+
+Đoạn trùng = các cảnh liên tiếp giống nhau, cùng thứ tự, ở cả hai video (một cảnh đứng riêng cũng là một đoạn).
+Hai giới hạn độc lập: giây chống hai video có đoạn giống nhau dễ nhận ra; % chống hai video dùng cùng một danh sách cảnh
+đảo thứ tự. Video gốc ngắn, khó đủ thời lượng thì tăng % và `REORDER_MAX_SCENE_USES`.
 
 **Ưu tiên khi chỉnh: giảm trùng cảnh giữa các video, nhưng vẫn giữ đủ nội dung.** Mỗi video phải tự đứng được
 (mở đầu, các ý chính của góc tiếp cận, kêu gọi mua), không cắt bớt ý chỉ để né trùng.
 
 Quy tắc kiểm tra (sai thì gửi lỗi lại cho Gemini trong cùng cuộc trò chuyện, tối đa 3 lần):
 
-- mỗi video trong khoảng cho phép ở trên (mặc định 8-20 giây, mục tiêu 15 giây);
+- mỗi video trong khoảng cho phép ở trên (mặc định 10-20 giây, mục tiêu 15 giây);
 - trong một video mỗi cảnh xuất hiện tối đa một lần;
 - đúng `REORDER_TARGET_VIDEOS` video (nếu có đặt);
 - mọi cảnh được dùng ít nhất một lần (trừ khi bị bỏ như trên);
-- mỗi cảnh dùng trong tối đa 2 video;
-- hai video dùng chung tối đa 50% số cảnh của video ngắn hơn.
+- mỗi cảnh dùng trong tối đa `REORDER_MAX_SCENE_USES` video;
+- hai video dùng chung tối đa `REORDER_MAX_SHARED_PERCENT`% số cảnh của video ngắn hơn;
+- mỗi đoạn trùng giữa hai video dài không quá `REORDER_MAX_SHARED_RUN_S` giây;
+- trong một video, mỗi đoạn từ 2 cảnh có số liền nhau tăng dần (giống video gốc) dài không quá `REORDER_SOURCE_RUN_MAX_S` giây.
 
 `reorder.json`:
 ```
@@ -285,10 +332,18 @@ khung chữ thật (`text_box`, không đệm). Vùng chữ căn giữa theo khu
 bên bị dính vật sáng thì lấy theo bên gần tâm hơn).
 
 `--mode panel|fill` (cách cũ) che ngay trên clip: tấm kính mờ bo góc (`box`, có đệm, cách mép khung hình ít nhất 3%),
-chữ bên dưới được xoá trước khi làm mờ, và ghi clip vào `output_dir`; khi đó bước 7 phải lấy clip từ `clean/`. Caption dài gần hết chiều ngang vẫn được nhận. Khi không nhận ra được theo dòng chữ (chữ dính vào
-vật sáng phía sau, hoặc chữ to hơn caption nằm trên dòng caption), bước dự phòng đo chiều cao thật của chữ theo mật độ
-pixel từng hàng quanh dòng caption (chấp nhận chữ cao tới 2,4 lần caption, câu ngắn từ 2 chữ).
-Mọi chữ nằm trên dòng caption đều bị che (kể cả chữ to hơn caption); chữ overlay ở vị trí khác được giữ nguyên.
+chữ bên dưới được xoá trước khi làm mờ, và ghi clip vào `output_dir`; khi đó bước 7 phải lấy clip từ `clean/`. Caption dài gần hết chiều ngang vẫn được nhận. Khung hình nào không nhận ra được theo dòng chữ (chữ dính vào
+vật sáng phía sau) thì bước dự phòng dò mật độ pixel chữ, chỉ trong các hàng của dòng caption (câu ngắn từ 2 chữ).
+
+**Vị trí caption:** dò toàn khung hình (3-95% chiều cao), nên caption ở trên, giữa hay dưới đều được. Mỗi video có một vị trí:
+nơi có nhiều clip có chữ nhất, mỗi clip tính theo độ rộng chữ. Không được chọn: vị trí có ở dưới 3 clip hoặc dưới 15% số clip, chữ
+hẹp (trung vị dưới 15% bề ngang) hoặc lệch tâm, và chữ không đổi suốt video (tiêu đề/logo cố định, xét khi có từ 5 clip).
+Caption 2-3 dòng được nhận là một khối.
+
+**Kích thước vùng chữ:** chiều cao là 1, 2 hoặc 3 dòng tuỳ clip (`rows`), mỗi dòng cao bằng dòng caption (trung vị của các câu bình
+thường trong video, dòng cao 1-6% khung hình); chiều dài là của câu bình thường trong clip. **Chữ to nằm trên dòng caption không
+được tính là caption**: clip chỉ có chữ to là `"caption": false` và không làm tấm kính to ra, nên phần chữ to
+vượt ra ngoài tấm kính vẫn thấy. Chữ overlay ở vị trí khác được giữ nguyên.
 
 | | |
 |---|---|
@@ -301,7 +356,7 @@ Mọi chữ nằm trên dòng caption đều bị che (kể cả chữ to hơn c
 `--mode fill`: chỉ xoá chữ, không có tấm kính. `--preview DIR`: lưu ảnh trước/sau của từng clip (`panel|fill`), hoặc
 một khung hình có vẽ khung chữ dò được màu xanh (`detect`).
 
-`captions.json`: `{"mode", "caption_line": {"center_y", "height"}, "frame": {"width", "height"}, "clips": {"<N>.mp4": {"caption", "method", "glyphs_removed", "detection", "box": {"x","y","w","h"}, "text_box": {"x","y","w","h"}, "start", "end", "hits", "mask_share"}}}`.
+`captions.json`: `{"mode", "caption_line": {"center_y", "height"}, "frame": {"width", "height"}, "clips": {"<N>.mp4": {"caption", "method", "glyphs_removed", "detection", "box": {"x","y","w","h"}, "text_box": {"x","y","w","h"}, "start", "end", "hits", "rows", "mask_share"}}}`.
 
 Lệnh n8n (sau `gemini_reorder`, stdout `json:.../reorder.json`):
 ```
@@ -446,9 +501,11 @@ Video nhỏ hơn 4K được **phóng lên 2160x3840** (lanczos, `--height 3840`
 `captions.json` (toạ độ theo clip gốc, `frame`) được nhân theo tỉ lệ. Phóng to không thêm chi tiết, file nặng hơn khoảng 3 lần.
 Phụ đề: chữ trắng đậm (Noto Sans Bold) có bóng, hiện đúng `start`-`end` của từng câu trong `tts.json`,
 đặt giữa một tấm kính mờ (hình chữ nhật bo góc, căn giữa khung hình, trên dòng caption).
+Video có cảnh caption 2 dòng thì tấm kính cao đủ 2 dòng suốt video (kích thước cố định).
 - **Kích thước cố định cho cả video** (không phóng to thu nhỏ): chiều dài lớn nhất và chiều cao lớn nhất trong số
   nền của các câu tiếng Việt và vùng chữ Trung trong các cảnh của video (lấy từ `captions.json` + `reorder.json`).
-- **Che luôn chữ Trung** (`captions.json` mode `detect`): vùng chữ Trung là `text_box` + lề an toàn 0,12 x chiều cao
+- Đệm quanh chữ Việt: mỗi bên 0,5 x cỡ chữ, trên/dưới 0,25 x cỡ chữ, nên tấm kính chỉ vừa với chữ Trung và chữ Việt.
+- **Che luôn chữ Trung** (`captions.json` mode `detect`): vùng chữ Trung là `text_box` + lề an toàn 0,15 x chiều cao
   dòng caption (viền/bóng chữ), không đệm thêm, luôn cách mép khung hình ít nhất 3%. Kính được làm mờ mạnh (0,85 x chiều cao dòng caption, như tấm che cũ)
   để chữ không ánh qua; hiện cả khi `--no-subtitles`. Thiếu `reorder.json` thì `fail`.
 - Với `captions.json` mode `panel|fill` (cách cũ), tấm kính phủ lên tấm che cũ (`box` + 0,3% chiều cao) để không lộ mép.
@@ -478,7 +535,7 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
 
 | Ở đâu | Gì |
 |---|---|
-| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `REORDER_TARGET_VIDEOS`, `TARGET_VIDEO_S` (bước 5); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
+| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `SCENE_MAX_S`, `SCENE_PART_S`, `SCENE_TRIM_S` (bước 3); `REORDER_TARGET_VIDEOS`, `TARGET_VIDEO_S`, `REORDER_MAX_SCENE_USES`, `REORDER_MAX_SHARED_PERCENT`, `REORDER_MAX_SHARED_RUN_S`, `REORDER_SOURCE_RUN_TARGET_S`, `REORDER_SOURCE_RUN_MAX_S` (bước 5); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
 | `Dockerfile` | Alpine 3.24 (`apk`), ffmpeg, font Noto, Python 3.14, OpenCV/numpy từ `apk`, `uv`, `post_process` copy vào `/opt/post_process` |
 | `docker-compose.yml` | `./media` -> `/data/media`, `./n8n_data` -> `/home/node/.n8n` |
 | Hằng số đầu mỗi script | ngưỡng quy tắc (thời lượng video, số lần dùng cảnh, kích thước caption, tốc độ đọc…) |
@@ -493,12 +550,14 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
 
 ## Hạn chế đã biết
 
-- `remove_captions`: caption chữ trắng trên nền rất sáng, ít tương phản có thể bị sót; chữ overlay ở vị trí khác
-  dòng caption không bị che (cố ý).
+- `split_video`: chuyển cảnh kiểu trượt, zoom, xoay không được dò riêng; mờ ra đen rồi sáng lại có thể chỉ bắt được một nửa.
+- `remove_captions`: caption chữ trắng trên nền rất sáng, ít tương phản có thể bị sót; mỗi video chỉ có một
+  vị trí caption (video đổi vị trí caption giữa chừng thì chỉ che vị trí chính); chữ overlay ở vị trí khác
+  dòng caption, và chữ to trên dòng caption, không được tính vào vùng che (cố ý).
 - `gemini_voiceover`: tên thương hiệu có thể được đọc không nhất quán (ví dụ "iKF"). Tốc độ đọc mặc định 3,9 âm tiết/giây
   đo với giọng Puck; thực tế dao động 3,4-4,7 tuỳ câu, nên `gemini_tts` có bước tăng tốc nhẹ để khớp.
 - `gemini_tts`: ranh giới câu được đoán từ khoảng lặng (hoặc chia theo âm tiết khi không đoán được), nên phụ đề có thể
   lệch vài phần mười giây; bản dự phòng 3.1 là model preview, giọng có thể khác 3.8 dù cùng tên giọng.
 - `render_videos`: bản ở `output/` vẫn còn caption và âm thanh gốc tiếng Trung; bản hoàn chỉnh ở `output/final/` thì không.
 - `compose_videos`: tấm kính cố định theo câu/vùng che lớn nhất của video nên câu ngắn có thể có nhiều khoảng trống;
-  chữ overlay lớn của video gốc (không nằm trên dòng caption) vẫn còn và có thể nằm sát tấm kính.
+  chữ overlay lớn của video gốc vẫn còn: có thể nằm sát tấm kính, hoặc lộ phía trên/dưới khi nằm trên dòng caption.

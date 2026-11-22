@@ -4,6 +4,19 @@
 Usage:
     python split_scenes.py <input_video> <output_dir>
 
+Scenes come from two detectors together: PySceneDetect (fast cuts) and scene_cuts.py
+(OpenCV: cuts PySceneDetect leaves out because they are close to another one, and
+dissolves). Every place one of them finds is used; the mixed frames of a dissolve belong
+to no scene. A scene still longer than SCENE_MAX_S is one long shot: it is cut into equal
+parts of at most SCENE_PART_S.
+
+Environment (.env):
+    SCENE_MAX_S      optional: longest scene in seconds, default 2.9; 0 = never cut a shot
+    SCENE_PART_S     optional: longest part of a cut shot in seconds, default 1.45 (two parts
+                     next to each other last at most 2.9 s)
+    SCENE_TRIM_S     optional: seconds that may be dropped from the end of a long shot when
+                     that saves a part, default 0.3
+
 Stdout: 'dir:<absolute output_dir>' (the folder with the clips) on success,
         followed by one line 'long_scenes:<long>_<total>[-<n>_<n>...]' (scenes lasting
         at least LONG_SCENE_S, ascending; see long_scene_line), or exactly 'fail'.
@@ -16,21 +29,33 @@ Files:
     <output_dir>/../runlog.txt
     <output_dir>/../scenelog.csv
     <output_dir>/../scenelog.json
-    <output_dir>/../stats.json    "long_scenes" (job_stats.py); written fresh on every run
+    <output_dir>/../stats.json    "long_scenes" and "scene_detection" (job_stats.py); written
+                                  fresh on every run
 """
 
 import argparse
 import csv as csvlib
 import json
+import math
+import os
 import subprocess
 import sys
 import traceback
 from pathlib import Path
 
+from scenedetect import AdaptiveDetector, FrameTimecode, detect
+from scenedetect.output import write_scene_list
+
 try:  # python -m post_process.split_video
+    from post_process import scene_cuts
     from post_process.job_stats import stats_path, update_stats
 except ImportError:  # python post_process/split_video.py
+    import scene_cuts
     from job_stats import stats_path, update_stats
+
+MIN_SCENE_LEN = "0.6s"  # PySceneDetect: fast cuts closer than this are left out (its CLI default)
+# Same encoding as PySceneDetect's split-video.
+ENCODE = ["-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-sn"]
 
 
 def _convert_value(value: str):
@@ -107,6 +132,76 @@ def csv_to_json(csv_path: Path, json_path: Path) -> list[dict]:
     return scenes
 
 
+def seconds_setting(name: str, default: float) -> float:
+    """A number of seconds (0 or more) from the environment; empty = default."""
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number of seconds: {raw!r}") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a number of seconds, 0 or more: {raw!r}")
+    return value
+
+
+def scene_limits() -> tuple[float, float, float]:
+    """(SCENE_MAX_S, SCENE_PART_S, SCENE_TRIM_S) from the environment (.env)."""
+    max_s = seconds_setting("SCENE_MAX_S", 2.9)
+    part_s = seconds_setting("SCENE_PART_S", 1.45)
+    trim_s = seconds_setting("SCENE_TRIM_S", 0.3)
+    if 0 < max_s < 2 * scene_cuts.MIN_SCENE_S:
+        raise ValueError(f"SCENE_MAX_S must be 0 or at least {2 * scene_cuts.MIN_SCENE_S:g}: {max_s:g}")
+    # A part is never above the maximum, and never so small that scenes get too short.
+    return max_s, max(2 * scene_cuts.MIN_SCENE_S, min(part_s or max_s, max_s)), trim_s
+
+
+def find_scenes(video: Path) -> tuple[list[tuple[FrameTimecode, FrameTimecode]], dict]:
+    """Scenes of both detectors together, and what each one found (stats.json -> "scene_detection")."""
+    max_s, part_s, trim_s = scene_limits()
+    base = detect(str(video), AdaptiveDetector(min_scene_len=MIN_SCENE_LEN), start_in_scene=True)
+    if not base:
+        raise RuntimeError("PySceneDetect found no frames")
+    clock = base[0][0]
+    frames, times = scene_cuts.read_frames(video)
+    cut_frames = scene_cuts.find_cuts(frames)
+    dissolve_frames = scene_cuts.find_dissolves(frames, float(clock.frame_rate), cut_frames)
+
+    def time_of(index: int) -> float:
+        return float(times[index]) if index < len(times) else base[-1][1].seconds
+
+    cuts = [time_of(t) for t in cut_frames]
+    dissolves = [(time_of(a), time_of(b + 1)) for a, b in dissolve_frames]
+    scenes, added = scene_cuts.combine([(a.seconds, b.seconds) for a, b in base], cuts, dissolves)
+    scenes, long_split = scene_cuts.split_long(scenes, times, max_s, part_s, trim_s)
+    report = {
+        "scenedetect_scenes": len(base),
+        "opencv_cuts": len(cuts),
+        "opencv_cuts_added": [round(t, 3) for t in added],
+        "dissolves": [[round(a, 3), round(b, 3)] for a, b in dissolves],
+        "max_scene_s": max_s,
+        "long_shots_split": long_split,
+        "scene_count": len(scenes),
+    }
+    # PySceneDetect's own timecodes are kept where nothing changed (no rounding).
+    known = {t.seconds: t for pair in base for t in pair}
+
+    def timecode(seconds: float) -> FrameTimecode:
+        return known.get(seconds) or FrameTimecode(seconds, clock)
+
+    return [(timecode(a), timecode(b)) for a, b in scenes], report
+
+
+def split(video: Path, scenes: list[tuple[FrameTimecode, FrameTimecode]], output: Path) -> None:
+    """Write every scene to <output>/<N>.mp4."""
+    for number, (start, end) in enumerate(scenes, 1):
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-y", "-ss", str(start.seconds), "-i", str(video),
+             "-t", str((end - start).seconds), *ENCODE, str(output / f"{number}.mp4")],
+            capture_output=True, text=True, errors="replace", check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed for scene {number}: {result.stderr.strip()[-2000:]}")
+
+
 def fail(reason: str, log: Path | None = None, details: str = "") -> int:
     """Report a failure: reason to stderr (+ log file), 'fail' to stdout."""
     message = f"[split_scenes] {reason}"
@@ -155,39 +250,22 @@ def main() -> int:
             if old_clip.is_file() and old_clip.stem.isdigit():
                 old_clip.unlink()
 
-        command = [
-            sys.executable, "-m", "scenedetect",
-            "-l", str(log),
-            "-i", str(video),
-            "-o", str(output),
-            # Name clips by scene number only (001.mp4); renamed to 1.mp4 below.
-            "split-video", "-f", "$SCENE_NUMBER",
-            # list-scenes writes to the global -o dir by default; send the CSV
-            # to meta_dir explicitly so it lands where we look for it.
-            "list-scenes", "-o", str(meta_dir), "--filename", csv.name,
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, errors="replace", check=False)
-        output_text = (
-            f"Command: {' '.join(command)}\n"
-            f"Return code: {result.returncode}\n"
-            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
-        )
-
-        if result.returncode != 0:
-            return fail(f"scenedetect exited with code {result.returncode}", log, output_text)
-
-        if not csv.is_file():
-            return fail(f"scenedetect finished but CSV not found at {csv}", log, output_text)
-
-        # Strip zero padding: 001.mp4 -> 1.mp4
         try:
-            for clip in sorted(output.iterdir()):
-                if clip.is_file() and clip.stem.isdigit():
-                    target = clip.with_name(f"{int(clip.stem)}{clip.suffix}")
-                    if target != clip:
-                        clip.replace(target)
-        except OSError:
-            return fail(f"Could not rename clips in {output}", log, traceback.format_exc())
+            found, report = find_scenes(video)
+            split(video, found, output)
+            with csv.open("w", encoding="utf-8", newline="") as f:
+                write_scene_list(f, found)
+        except Exception:
+            return fail(f"Could not split {video}", log, traceback.format_exc())
+        log.write_text("\n".join([
+            f"PySceneDetect: {report['scenedetect_scenes']} scenes",
+            f"OpenCV: {report['opencv_cuts']} cuts, {len(report['opencv_cuts_added'])} added: "
+            f"{report['opencv_cuts_added']}",
+            f"OpenCV dissolves (left out): {report['dissolves']}",
+            f"Long shots cut into equal parts (over {report['max_scene_s']:g}s): {report['long_shots_split']}",
+            f"Result: {report['scene_count']} scenes",
+            *(f"  {n}: {a.seconds:.3f} - {b.seconds:.3f}" for n, (a, b) in enumerate(found, 1)),
+        ]) + "\n", encoding="utf-8")
 
         try:
             scenes = csv_to_json(csv, json_file)
@@ -198,6 +276,7 @@ def main() -> int:
             stats = long_scene_stats(scenes)
             # New scenes: start stats.json over (overlaps of an older plan no longer apply).
             update_stats(stats_path(meta_dir), "long_scenes", stats, reset=True)
+            update_stats(stats_path(meta_dir), "scene_detection", report)
         except Exception:
             return fail(f"Could not write {stats_path(meta_dir)}", log, traceback.format_exc())
 

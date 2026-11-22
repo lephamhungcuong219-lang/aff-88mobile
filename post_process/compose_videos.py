@@ -62,13 +62,13 @@ FONT_SIZE = 0.026         # x height: subtitle font size
 MIN_FONT_SIZE = 0.018     # never smaller than this; longer lines fail instead
 MAX_PANEL_WIDTH = 0.90    # x width: a subtitle panel is never wider (longer lines get a smaller font)
 OLD_COVER_OUTSET = 0.003  # x height: grow old caption covers a little so their edges are hidden (panel/fill)
-COVER_MARGIN = 0.12       # x caption line height: safety margin around a Chinese text box (detect):
+COVER_MARGIN = 0.15       # x caption line height: safety margin around a Chinese text box (detect):
                           # outline/shadow of the glyphs, samples the detection missed
 COVER_BLUR = 0.85         # x caption line height: glass blur over raw Chinese captions (detect)
 COVER_EDGE_MARGIN = 0.03  # x width: a Chinese cover never comes closer to the frame edges (as remove_captions'
                           # own panel): a text box reaching the edge is bright background, not text (detect)
-PAD_X = 0.9               # x font size: space left/right of the longest line
-PAD_Y = 0.45              # x font size: space above/below the text
+PAD_X = 0.5               # x font size: space left/right of the longest line
+PAD_Y = 0.25              # x font size: space above/below the text
 DEFAULT_LINE_Y = 0.725    # caption line centre when captions.json is missing
 
 # Glass look (same family as remove_captions.py)
@@ -204,11 +204,15 @@ def plan_panels(items: list[tuple[float, float, Rect]], duration: float, width: 
     return [(even(fixed, width, height), [(0.0, round(duration, 3))])]
 
 
-def panel_mask(path: Path, w: int, h: int) -> None:
-    """Rounded-rectangle alpha mask (white = glass) with anti-aliased edges."""
+def panel_mask(path: Path, w: int, h: int, row_h: float) -> None:
+    """Rounded-rectangle alpha mask (white = glass) with anti-aliased edges.
+
+    The corners are those of a panel of one row (row_h): a taller panel, over a caption of
+    several rows, must not show text in its corners.
+    """
     scale = 4  # draw big, shrink: smooth corners
     big = np.zeros((h * scale, w * scale), np.uint8)
-    r = max(2, int(CORNER * h * scale))
+    r = max(2, int(CORNER * min(h, row_h) * scale))
     cv2.rectangle(big, (r, 0), (w * scale - 1 - r, h * scale - 1), 255, -1)
     cv2.rectangle(big, (0, r), (w * scale - 1, h * scale - 1 - r), 255, -1)
     for cx, cy in ((r, r), (w * scale - 1 - r, r), (r, h * scale - 1 - r), (w * scale - 1 - r, h * scale - 1 - r)):
@@ -242,7 +246,7 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
     with_panel = with_text or bool(covers and detect_mode(captions))
     if with_panel:
         items, files, font = [], [], 0
-        line_y = (captions or {}).get("caption_line", {}).get("center_y", DEFAULT_LINE_Y) * height
+        line_y = ((captions or {}).get("caption_line") or {}).get("center_y", DEFAULT_LINE_Y) * height
     if with_text:
         # Text files (no escaping problems) and measurements.
         for i, seg in enumerate(segments):
@@ -275,6 +279,8 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
         items += covers
         panels = plan_panels(items, duration, width, height)
 
+        cap_h = float(((captions or {}).get("caption_line") or {}).get("height", 0.05)) * height
+        row_h = max((1 + 2 * COVER_MARGIN) * cap_h, text_h + 2 * PAD_Y * font if with_text else 0)
         tint = TINTS[args.tint]
         blur = BLUR_SIGMA * height
         if covers and detect_mode(captions):
@@ -287,7 +293,7 @@ def compose(video: dict, source: Path, target: Path, voice: Path, plan_video: di
         first_mask_input = 2
         for k, ((px, py, pw, ph), spans) in enumerate(panels):
             mask = work / f"v{index}_mask{k}.png"
-            panel_mask(mask, pw, ph)
+            panel_mask(mask, pw, ph, row_h)
             inputs += ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(mask)]
             # Desaturated glass: the colour of a removed caption (e.g. yellow) does not show through.
             filters.append(f"[cut{k}]crop={pw}:{ph}:{px}:{py},gblur=sigma={blur:.1f},"

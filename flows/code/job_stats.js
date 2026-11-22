@@ -1,5 +1,5 @@
 // n8n Code node — mode "Run Once for Each Item", language JavaScript.
-// Gom thống kê của split_video (long_scenes) và gemini_reorder (overlap) thành một JSON.
+// Gom thống kê của split_video (long_scenes) và gemini_reorder (overlap, source_overlap) thành một JSON.
 // Cấu trúc giống <job>/temp/<awemeId>/stats.json (file này là bản đầy đủ, luôn có trên đĩa).
 //
 // Đặt node ở NHÁNH RIÊNG sau node "Nấu các cảnh" (hoặc cuối workflow): Code node thay $json,
@@ -38,6 +38,27 @@ const perVideo = [...reorderOut.matchAll(/^overlap_video:(\d+)-([\d.]+)_([\d.]+)
   };
 });
 
+// So với video gốc:
+// source_overlap:<video>-<các cảnh>-<số giây>   (một dòng cho mỗi đoạn giống hệt video gốc)
+const sourceRuns = [...reorderOut.matchAll(/^source_overlap:(\d+)-([\d_]+)-([\d.]+)\r?$/gm)].map((m) => ({
+  video: Number(m[1]),
+  scenes: m[2].split('_').map(Number),
+  seconds: Number(m[3]),
+}));
+
+// source_overlap_video:<video>-<số giây trong các đoạn>_<thời lượng video>_<đoạn dài nhất>   (mỗi video một dòng)
+const sourcePerVideo = [...reorderOut.matchAll(/^source_overlap_video:(\d+)-([\d.]+)_([\d.]+)_([\d.]+)\r?$/gm)].map((m) => {
+  const shared = Number(m[2]);
+  const total = Number(m[3]);
+  return {
+    video_index: Number(m[1]),
+    shared_seconds: shared,
+    total_duration: total,
+    shared_ratio: total ? Math.round((shared / total) * 1000) / 1000 : 0,
+    longest_seconds: Number(m[4]),
+  };
+});
+
 const reorderJson = (reorderOut.match(/^json:(.*)$/m) || [])[1]?.trim() ?? null;
 const statsJson = reorderJson ? reorderJson.replace(/\/[^/]+$/, '/stats.json') : null;
 const jobId = reorderJson ? (reorderJson.match(/\/jobs\/([^/]+)\//) || [])[1] ?? null : null;
@@ -49,12 +70,15 @@ return {
     reorder_json: reorderJson,
     long_scenes: longScenes,
     overlaps: perVideo.length ? { runs, per_video: perVideo } : null,
+    source_overlaps: sourcePerVideo.length ? { runs: sourceRuns, per_video: sourcePerVideo } : null,
     summary: {
       long_scene_count: longScenes?.long_count ?? null,
       scene_count: longScenes?.scene_count ?? null,
       overlap_run_count: runs.length,
       videos_with_overlap: perVideo.filter((v) => v.shared_seconds > 0).map((v) => v.video_index),
       max_shared_ratio: perVideo.length ? Math.max(...perVideo.map((v) => v.shared_ratio)) : null,
+      source_run_count: sourceRuns.length,
+      max_source_run_s: sourcePerVideo.length ? Math.max(...sourcePerVideo.map((v) => v.longest_seconds)) : null,
     },
   },
 };

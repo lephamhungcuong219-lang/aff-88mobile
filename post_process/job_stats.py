@@ -3,7 +3,9 @@
 One file per source video, next to scenelog.json / reorder.json
 (<job>/temp/<awemeId>/stats.json). Each step owns one top-level key:
     "long_scenes"  split_video.py     scenes lasting at least LONG_SCENE_S
+    "scene_detection"  split_video.py  what each scene detector found
     "overlaps"     gemini_reorder.py  runs of consecutive scenes shared by videos
+    "source_overlaps"  gemini_reorder.py  passages of the source inside each video
 A step replaces only its own key, so the file keeps what the other steps wrote.
 """
 

@@ -77,6 +77,22 @@ if (!ov) {
   }
 }
 
+// So các video output với video gốc: đoạn giống hệt gốc = các cảnh số liền nhau đặt cạnh nhau.
+const so = stats.source_overlaps;
+if (so) {
+  const limit = so.max_s > 0 ? ` (mục tiêu ${so.target_s}s, tối đa ${so.max_s}s)` : '';
+  lines.push('', `**Trùng với video gốc**${limit}`);
+  for (const v of so.per_video) {
+    lines.push(`Video ${v.video_index}: ${sec(v.shared_seconds)} / ${sec(v.total_duration)} · ${pct(v.shared_ratio)}`
+      + ` · dài nhất ${sec(v.longest_seconds)} (cảnh ${sceneList(v.longest_scenes)})`);
+  }
+  lines.push('', `**Đoạn giống hệt video gốc: ${so.runs.length}**`);
+  const mark = { above_target: ' · trên mục tiêu', too_long: ' · QUÁ DÀI' };
+  for (const r of so.runs) {
+    lines.push(`Video ${r.video} · cảnh ${sceneList(r.scenes)} (${r.scenes.length} cảnh) · ${sec(r.seconds)}${mark[r.level] ?? ''}`);
+  }
+}
+
 let content = lines.join('\n');
 if (content.length > MAX_CONTENT) content = `${content.slice(0, MAX_CONTENT - 30)}\n… (bị cắt bớt)`;
 
@@ -90,6 +106,7 @@ return {
     job_id: jobId,
     aweme_id: awemeId,
     max_shared_ratio: maxRatio,
+    max_source_run_s: so ? Math.max(0, ...so.per_video.map((v) => v.longest_seconds)) : null,
     stats_json: statsJson,
   },
 };

@@ -18,12 +18,18 @@ Finding captions (classic image processing, OpenCV + numpy only):
      words) and outlined/shadowed with dark pixels, so a pixel counts as "text"
      when it is bright AND much brighter than its darkest neighbour.
   3. Text pixels are joined horizontally into lines; a line is a candidate when
-     it is caption-sized (small, wide, horizontally centred) and in the lower
-     part of the frame. Big overlay titles are too tall and are ignored.
-  4. Captions of one video sit on ONE fixed line. Candidates of all clips are
-     pooled, the dominant line is found, and only candidates on it are kept.
+     it is caption-sized (small, wide, horizontally centred), anywhere in the frame
+     (captions can be at the top or at the bottom). Big overlay titles are too tall
+     and are ignored. Lines stacked in one frame are one caption of 2-3 rows.
+  4. Captions of one video sit at ONE fixed place. Candidates of all clips are
+     pooled and the place with the most clips and the widest text wins. Text that
+     never changes (a fixed title, a logo) and small scattered marks are not captions.
+     The layouts of that place (1, 2 or 3 rows) are measured, and only candidates
+     fitting one of them are kept.
   5. Per clip, the kept boxes are merged into one region covering the whole
-     sentence, with the time span in which it is visible.
+     sentence, with the time span in which it is visible. Its height is always
+     the height of the clip's layout (1, 2 or 3 rows of normal text). Big text on
+     the caption line is not a caption: it never changes the region.
 
 Removing captions (panel / fill only; only inside the region and time span):
     A stable mask is built for the caption: glyph pixels, their drop shadow /
@@ -68,8 +74,8 @@ WARM_HUE_MAX, WARM_HUE_WRAP = 40, 165  # OpenCV hue (0-180): red..yellow, and re
 CONTRAST_MIN = 70         # glyph must be this much brighter than its darkest neighbour
 
 # Caption geometry, as fractions of the frame
-ZONE_TOP, ZONE_BOTTOM = 0.45, 0.95
-LINE_H_MIN, LINE_H_MAX = 0.010, 0.080  # up to bigger text sitting on the caption line
+ZONE_TOP, ZONE_BOTTOM = 0.03, 0.95
+LINE_H_MIN, LINE_H_MAX = 0.010, 0.060  # a spoken-line caption; bigger text is not a caption
 CENTER_X_MIN, CENTER_X_MAX = 0.30, 0.70
 MIN_ASPECT = 2.5          # width / height of a caption line
 MAX_LINE_WIDTH = 0.995    # x width: long captions can run almost edge to edge
@@ -78,21 +84,32 @@ FILL_MIN, FILL_MAX = 0.06, 0.65
 # Dominant caption line
 LINE_BIN = 0.01           # y histogram bin
 MIN_CLIPS_ON_LINE = 3     # fewer clips than this on one line -> no captions
+MIN_CLIP_SHARE = 0.15     # ... or fewer than this share of the clips
+MIN_LINE_WIDTH = 0.15     # x width: median text width on the line (marks on objects are narrower)
+MAX_LINE_OFFSET = 0.06    # x width: the line's text is centred on the frame, within this
+STATIC_MIN_CLIPS = 5      # with at least this many clips on the line, look for text that never changes:
+STATIC_IOU = 0.5          # ... median overlap of the text of two clips above this -> fixed title / logo
 LINE_Y_TOLERANCE = 0.6    # x median line height
-LINE_H_RANGE = (0.6, 2.4) # accepted height relative to the median line height (bigger text on
-                          # the caption line is covered too, with a taller panel)
+LINE_H_RANGE = (0.6, 1.35) # accepted height relative to the median line height
 EDGE_SNAP_S = 0.4         # caption found this close to the clip start/end: cover up to the cut
 MIN_HITS_PER_CLIP = 2     # samples a caption must appear in
 
-# Band fallback: for clips where no line-shaped caption was found (e.g. the
-# caption touches bright background), look for text pixels inside the caption band.
-BAND_REACH = 1.6          # x line height: rows searched above/below the line for the text
-BAND_COLUMNS = 0.9        # x width: central part of the frame used to measure row density
-BAND_ROW_SHARE = 0.35     # a row belongs to the text when its density reaches this share of the peak
+# Captions of several rows
+MAX_ROWS = 3
+ROW_PITCH = (0.7, 1.6)    # distance of two rows' centres, x line height
+ROW_CENTER = 0.05         # x width: every row of a block is centred on the frame, within this
+LAYOUT_MIN_CLIPS = 2      # a layout other than the dominant one must be seen in this many clips
+LAYOUT_REACH = 1.2        # ... with its centre this close to the dominant one's, x line height
+LAYOUT_Y_TOLERANCE = 0.3  # a block belongs to its layout within this, x line height (several layouts)
+ROW_GAP_DENSITY = 0.5     # band fallback: text density between two rows, relative to the rows
+
+# Band fallback: for frames where no line-shaped caption was found (e.g. the caption touches
+# bright background), look for text pixels inside the rows of the caption line.
 BAND_COLUMN_MIN = 0.04    # a column belongs to the text when this share of its rows is text
 BAND_MIN_ASPECT = 1.8     # width / height: short captions of two characters are accepted
 BAND_DENSITY_MIN = 0.06   # text pixel share inside the band (over the text's width)
-BAND_CONTRAST = 3.0       # band density must exceed the strips above/below this many times
+BAND_CONTRAST = 2.0       # band density must exceed the strips above/below this many times
+                          # (normal captions: 2.3 and more; big text crossing the strips: below 1.4)
 BAND_EDGE = 0.3           # x line height: strips right above/below the band
 
 # Region around the sentence
@@ -115,7 +132,7 @@ EDGE_FEATHER = 0.08       # soft blend at the mask border
 # Frosted glass panel (a clean rounded rectangle, centred on the frame)
 FROST_SIGMA = 0.8         # x line height: blur strength
 FROST_LIGHTEN = 0.10      # share of white mixed in (a light, glassy look)
-FROST_CORNER = 0.22       # x panel height: corner radius
+FROST_CORNER = 0.22       # x panel height of ONE row: corner radius (bigger corners would show text)
 FROST_EDGE_PX = 1.5       # anti-aliasing of the panel edge, in full-size pixels
 
 ENCODE = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
@@ -183,10 +200,10 @@ def text_mask(frame: np.ndarray) -> np.ndarray:
     return (bright & contrast).astype(np.uint8) * 255
 
 
-def find_lines(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
-    """Return caption-like line boxes (x, y, w, h) as fractions of the frame."""
-    h, w = frame.shape[:2]
-    mask = text_mask(frame)
+def find_lines(text: np.ndarray) -> list[tuple[float, float, float, float]]:
+    """Caption-like line boxes (x, y, w, h), as fractions of the frame, in a text_mask."""
+    h, w = text.shape
+    mask = text.copy()
     mask[: int(ZONE_TOP * h)] = 0
     mask[int(ZONE_BOTTOM * h):] = 0
 
@@ -211,50 +228,196 @@ def find_lines(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
     return lines
 
 
-def dominant_line(candidates: dict[str, list]) -> tuple[float, float] | None:
-    """(center y, height) of the line most clips put captions on, or None."""
-    clips_per_bin: dict[int, set] = {}
-    for name, items in candidates.items():
-        for _, (_, y, _, h) in items:
-            clips_per_bin.setdefault(int((y + h / 2) / LINE_BIN), set()).add(name)
-    if not clips_per_bin:
-        return None
-    scores = {b: len(set().union(*(clips_per_bin.get(b + d, set()) for d in (-1, 0, 1))))
-              for b in clips_per_bin}
-    best = max(scores, key=lambda b: scores[b])
-    if scores[best] < MIN_CLIPS_ON_LINE:
-        return None
-    center = (best + 0.5) * LINE_BIN
-    heights = [h for items in candidates.values() for _, (_, y, _, h) in items
-               if abs(y + h / 2 - center) <= 1.5 * LINE_BIN]
-    return center, float(np.median(heights))
+def center_of(box: tuple) -> float:
+    return box[1] + box[3] / 2
 
 
-def clip_region(items: list, line: tuple[float, float], duration: float) -> dict | None:
-    """Merge one clip's on-line boxes into a single region (whole sentence) with a time span."""
-    center, height = line
-    kept = [(t, box) for t, box in items
-            if abs(box[1] + box[3] / 2 - center) <= LINE_Y_TOLERANCE * height
-            and LINE_H_RANGE[0] * height <= box[3] <= LINE_H_RANGE[1] * height]
-    if len({t for t, _ in kept}) < MIN_HITS_PER_CLIP:
+def group_rows(lines: list[tuple]) -> list[tuple[tuple, ...]]:
+    """One frame's line boxes -> blocks: rows stacked right above each other are one caption."""
+    others, centred = [], []
+    for box in sorted(lines, key=center_of):
+        if abs(box[0] + box[2] / 2 - 0.5) > ROW_CENTER:
+            others.append([box])
+            continue
+        last = centred[-1] if centred else None
+        if last and len(last) < MAX_ROWS:
+            low, high = sorted((last[-1][3], box[3]))
+            pitch = center_of(box) - center_of(last[-1])
+            if low >= LINE_H_RANGE[0] * high and ROW_PITCH[0] * high <= pitch <= ROW_PITCH[1] * high:
+                last.append(box)
+                continue
+        centred.append([box])
+    return [tuple(b) for b in others + centred]
+
+
+def block_center(block: tuple) -> float:
+    return (block[0][1] + block[-1][1] + block[-1][3]) / 2
+
+
+def block_box(block: tuple) -> tuple[float, float, float, float]:
+    x0, x1 = min(b[0] for b in block), max(b[0] + b[2] for b in block)
+    return x0, block[0][1], x1 - x0, block[-1][1] + block[-1][3] - block[0][1]
+
+
+def normal_rows(block: tuple, height: float) -> bool:
+    """True when every row is as tall as a normal sentence."""
+    return all(LINE_H_RANGE[0] * height <= r[3] <= LINE_H_RANGE[1] * height for r in block)
+
+
+def is_static(times: dict[str, set], masks: dict[str, list], center: float, height: float) -> bool:
+    """True when the text in these rows is the same in most clips (a fixed title, a logo).
+
+    times: per clip, the samples with text there.
+    """
+    shapes = []
+    for name, seen in times.items():
+        if len(seen) < MIN_HITS_PER_CLIP:
+            continue
+        rows = masks[name][0].shape[0]
+        top, bottom = max(0, int((center - height / 2) * rows)), int(np.ceil((center + height / 2) * rows))
+        share = np.mean([np.unpackbits(masks[name][int(round(t * SAMPLE_FPS))][top:bottom], axis=1,
+                                       count=ANALYSIS_WIDTH) for t in seen], axis=0)
+        shapes.append(share >= 0.6)
+    if len(shapes) < STATIC_MIN_CLIPS:
+        return False
+    overlaps = [np.logical_and(a, b).sum() / max(1, np.logical_or(a, b).sum())
+                for i, a in enumerate(shapes) for b in shapes[i + 1:]]
+    return float(np.median(overlaps)) > STATIC_IOU
+
+
+def dominant_line(blocks: dict[str, list], masks: dict[str, list]) -> tuple[float, float, int] | None:
+    """(center y, row height, rows) of the place the captions of this video are at, or None.
+
+    blocks: per clip, (time, block) of group_rows. The place with the most clips wins, each
+    clip counting as much as its text is wide: captions are in many clips and wide, marks on
+    objects are in few and narrow. Centre and height are medians over the normal sentences:
+    boxes much taller than the rest (a caption joined to bright background, bigger text) are
+    left out.
+    """
+    per_bin: dict[tuple, dict[str, list]] = {}  # (rows, y bin) -> clip -> text widths
+    for name, items in blocks.items():
+        for _, b in items:
+            key = (len(b), int(block_center(b) / LINE_BIN))
+            per_bin.setdefault(key, {}).setdefault(name, []).append(block_box(b)[2])
+
+    def near(key: tuple) -> dict[str, list]:
+        clips: dict[str, list] = {}
+        for d in (-1, 0, 1):
+            for name, widths in per_bin.get((key[0], key[1] + d), {}).items():
+                clips.setdefault(name, []).extend(widths)
+        return clips
+
+    scores = {key: sum(float(np.median(w)) for w in near(key).values()) for key in per_bin}
+    fixed: list[tuple[float, float]] = []  # (top, bottom) of text that never changes
+    for key in sorted(scores, key=lambda k: -scores[k]):
+        rows, middle = key[0], (key[1] + 0.5) * LINE_BIN
+        if (len(near(key)) < max(MIN_CLIPS_ON_LINE, MIN_CLIP_SHARE * len(blocks))
+                or any(top <= middle <= bottom for top, bottom in fixed)):
+            continue
+        found = [(name, t, b) for name, items in blocks.items() for t, b in items
+                 if len(b) == rows and abs(block_center(b) - middle) <= 1.5 * LINE_BIN]
+        typical = float(np.median([r[3] for _, _, b in found for r in b]))
+        normal = [(name, t, b) for name, t, b in found if normal_rows(b, typical)]
+        if not normal:
+            continue
+        center = float(np.median([block_center(b) for _, _, b in normal]))
+        height = float(np.median([r[3] for _, _, b in normal for r in b]))
+        boxes = [block_box(b) for _, _, b in normal]
+        if (float(np.median([b[2] for b in boxes])) < MIN_LINE_WIDTH
+                or abs(float(np.median([b[0] + b[2] / 2 for b in boxes])) - 0.5) > MAX_LINE_OFFSET):
+            continue
+        times: dict[str, set] = {}
+        for name, t, _ in normal:
+            times.setdefault(name, set()).add(t)
+        tall = float(np.median([b[3] for b in boxes]))
+        if is_static(times, masks, center, tall):
+            fixed.append((center - tall, center + tall))
+            log(f"Text at {center * 100:.1f}% of the height never changes: not a caption")
+            continue
+        return center, height, rows
+    return None
+
+
+def caption_layouts(blocks: dict[str, list], line: tuple[float, float, int]) -> list[dict]:
+    """Layouts of this video's captions, fewest rows first: rows, top, bottom, row centres."""
+    center, height, main_rows = line
+    layouts: dict[int, dict] = {}
+    for rows in sorted(range(1, MAX_ROWS + 1), key=lambda r: r != main_rows):  # the dominant one first
+        reach = (LAYOUT_Y_TOLERANCE if rows == main_rows else LAYOUT_REACH) * height
+        found: dict[str, list] = {}
+        for name, items in blocks.items():
+            for _, b in items:
+                if len(b) != rows or not normal_rows(b, height) or abs(block_center(b) - center) > reach:
+                    continue
+                if rows == 1 and main_rows > 1 and any(abs(block_center(b) - c) <= LAYOUT_Y_TOLERANCE * height
+                                                       for c in layouts[main_rows]["centers"]):
+                    continue  # one row of the dominant layout, its other rows were missed
+                found.setdefault(name, []).append(b)
+        if rows != main_rows:
+            # Another layout: the place most of these clips agree on.
+            found = {n: v for n, v in found.items() if len(v) >= MIN_HITS_PER_CLIP}
+            if len(found) < LAYOUT_MIN_CLIPS:
+                continue
+            middle = float(np.median([np.median([block_center(b) for b in v]) for v in found.values()]))
+            found = {n: kept for n, v in found.items()
+                     if (kept := [b for b in v if abs(block_center(b) - middle) <= LAYOUT_Y_TOLERANCE * height])}
+            if len(found) < LAYOUT_MIN_CLIPS:
+                continue
+        kept = [b for v in found.values() for b in v]
+        centers = [float(np.median([center_of(b[i]) for b in kept])) for i in range(rows)] if kept else [center]
+        layouts[rows] = {"rows": rows, "centers": centers, "center": (centers[0] + centers[-1]) / 2,
+                         "top": centers[0] - height / 2, "bottom": centers[-1] + height / 2}
+    return [layouts[r] for r in sorted(layouts)]
+
+
+def match_layout(block: tuple, layouts: list[dict], height: float) -> dict | None:
+    """The layout a block of normal text belongs to, or None."""
+    if not normal_rows(block, height):
         return None
+    center = block_center(block)
+    if len(block) > 1:
+        return next((m for m in layouts if m["rows"] == len(block)
+                     and abs(center - m["center"]) <= LAYOUT_Y_TOLERANCE * height), None)
+    # One row: a one-row caption, or one row of a bigger caption whose other rows were missed.
+    # The nearest place wins; when (almost) equally near, the layout with fewer rows.
+    places = [(abs(center - c), m["rows"], m) for m in layouts for c in m["centers"]]
+    distance, _, layout = min(places, key=lambda p: (round(p[0] / (0.1 * height)), p[1]))
+    tolerance = LINE_Y_TOLERANCE if len(places) == 1 else LAYOUT_Y_TOLERANCE
+    return layout if distance <= tolerance * height else None
+
+
+def clip_region(blocks: list, bands: list, layouts: list[dict], height: float, duration: float) -> dict | None:
+    """Merge one clip's boxes into a single region (whole sentence) with a time span.
+
+    blocks: (time, block) of group_rows; bands: (time, box, layout) of band_box. The width
+    comes from the lines (tighter) when enough samples have one, otherwise from the bands as
+    well; the time span from both. The height is that of the layouts (1-3 rows) the clip shows.
+    """
+    lines = [(t, block_box(b), m) for t, b in blocks if (m := match_layout(b, layouts, height))]
+    seen = lines + bands
+    if len({t for t, _, _ in seen}) < MIN_HITS_PER_CLIP:
+        return None
+    enough = len({t for t, _, _ in lines}) >= MIN_HITS_PER_CLIP
+    kept = lines if enough else seen
     # Captions are centred on the frame. A box that also caught something bright on ONE
     # side (an icon, a light) is longer on that side only, so per frame the half width is
     # the side closer to the centre; the sentence is the widest of those over the clip.
-    halves = [min(0.5 - b[0], b[0] + b[2] - 0.5) for _, b in kept]
+    halves = [min(0.5 - b[0], b[0] + b[2] - 0.5) for _, b, _ in kept]
     halves = [h for h in halves if h > 0]
     if halves:
         half = max(halves)
         x0, x1 = 0.5 - half, 0.5 + half
     else:  # boxes not across the centre (not a centred caption): keep them as found
-        x0 = min(b[0] for _, b in kept)
-        x1 = max(b[0] + b[2] for _, b in kept)
-    # Vertically: at least the caption band, more when the text on the line is taller.
-    y0 = min([center - height / 2] + [b[1] for _, b in kept])
-    y1 = max([center + height / 2] + [b[1] + b[3] for _, b in kept])
+        x0 = min(b[0] for _, b, _ in kept)
+        x1 = max(b[0] + b[2] for _, b, _ in kept)
+    # Layouts the clip shows (it can show a caption of one row, then one of two rows).
+    hits = {m["rows"]: len({t for t, _, k in seen if k is m}) for m in layouts}
+    shown = ([m for m in layouts if hits[m["rows"]] >= MIN_HITS_PER_CLIP]
+             or [max(layouts, key=lambda m: (hits[m["rows"]], m["rows"]))])
+    y0, y1 = min(m["top"] for m in shown), max(m["bottom"] for m in shown)
     step = 1.0 / SAMPLE_FPS
-    start = max(0.0, min(t for t, _ in kept) - step)
-    end = min(duration, max(t for t, _ in kept) + 2 * step)
+    start = max(0.0, min(t for t, _, _ in seen) - step)
+    end = min(duration, max(t for t, _, _ in seen) + 2 * step)
     if start <= EDGE_SNAP_S:
         start = 0.0          # caption already on screen at the cut
     if end >= duration - EDGE_SNAP_S:
@@ -266,54 +429,38 @@ def clip_region(items: list, line: tuple[float, float], duration: float) -> dict
         "x": rx0, "w": rx1 - rx0,
         "y": y0 - PAD_Y * height, "h": (y1 - y0) + 2 * PAD_Y * height,
         "text": (x0, y0, x1 - x0, y1 - y0),  # the text itself: no padding, no edge margin
-        "line_h": height, "start": round(start, 3), "end": round(end, 3), "hits": len(kept),
+        "line_h": height, "start": round(start, 3), "end": round(end, 3), "hits": len({t for t, _, _ in seen}),
+        "detection": "line" if enough else "band", "rows": max(m["rows"] for m in shown),
     }
 
 
-def band_boxes(frame: np.ndarray, line: tuple[float, float]) -> tuple[float, float, float, float] | None:
-    """Caption box found by text density around the caption line, or None.
+def band_box(text: np.ndarray, layouts: list[dict], height: float) -> tuple[tuple, dict] | None:
+    """(box, layout) of a caption found by text density inside the rows of a layout, or None.
 
-    Works where line detection fails (text touching other bright edges, big text on the
-    caption line). The text height is measured from the rows dense with text pixels around
-    the line, so text up to LINE_H_RANGE[1] x the caption height is accepted; thin long
-    edges (an arm, a table) have a low row density and do not count.
+    Works where line detection fails (text touching other bright edges). Only the rows of
+    normal sentences are looked at, so the box never gets taller than the layout. Big text is
+    rejected: its glyphs go on above/below those rows, or fill the gap between two rows.
     """
-    h, w = frame.shape[:2]
-    center, height = line[0] * h, line[1] * h
-    reach = int(BAND_REACH * height)
-    lo, hi = max(0, int(center - reach)), min(h, int(center + reach))
-    mask = text_mask(frame) > 0
-    x0c, x1c = int((1 - BAND_COLUMNS) / 2 * w), int((1 + BAND_COLUMNS) / 2 * w)
-    rows = mask[lo:hi, x0c:x1c].mean(axis=1)
-    if rows.size == 0 or rows.max() < BAND_DENSITY_MIN:
+    for layout in layouts:
+        box = layout_band(text, layout, height)
+        if box:
+            return box, layout
+    return None
+
+
+def layout_band(text: np.ndarray, layout: dict, height: float) -> tuple[float, float, float, float] | None:
+    h, w = text.shape
+    line_px = height * h
+    top, bottom = max(0, int(round(layout["top"] * h))), min(h, int(round(layout["bottom"] * h)))
+    if bottom <= top:
         return None
-    # Rows of the text: the dense run that contains (or is closest to) the line centre.
-    dense = rows >= max(BAND_DENSITY_MIN / 2, BAND_ROW_SHARE * rows.max())
-    dense = cv2.morphologyEx(dense.astype(np.uint8)[:, None], cv2.MORPH_CLOSE,
-                             np.ones((max(3, int(0.25 * height)), 1), np.uint8))[:, 0] > 0
-    runs, start = [], None
-    for y, v in enumerate(list(dense) + [False]):
-        if v and start is None:
-            start = y
-        elif not v and start is not None:
-            runs.append((start, y))
-            start = None
-    if not runs:
-        return None
-    c = center - lo
-    top, bottom = min(runs, key=lambda r: 0 if r[0] <= c <= r[1] else min(abs(r[0] - c), abs(r[1] - c)))
-    text_h = bottom - top
-    if not (LINE_H_RANGE[0] * height <= text_h <= LINE_H_RANGE[1] * height):
-        return None
-    if abs((top + bottom) / 2 - c) > LINE_Y_TOLERANCE * height:
-        return None
-    top, bottom = top + lo, bottom + lo
+    mask = text > 0
 
     band = mask[top:bottom]
     # Columns with text, joined across the gaps between glyphs.
     cols = band.mean(axis=0) >= BAND_COLUMN_MIN
     cols = cv2.morphologyEx(cols.astype(np.uint8)[None, :], cv2.MORPH_CLOSE,
-                            np.ones((1, max(3, int(1.2 * height))), np.uint8))[0]
+                            np.ones((1, max(3, int(1.2 * line_px))), np.uint8))[0]
     col_runs, start = [], None
     for x, v in enumerate(list(cols) + [0]):
         if v and start is None:
@@ -322,17 +469,23 @@ def band_boxes(frame: np.ndarray, line: tuple[float, float]) -> tuple[float, flo
             col_runs.append((start, x))
             start = None
     col_runs = [(a, b) for a, b in col_runs if CENTER_X_MIN * w <= (a + b) / 2 <= CENTER_X_MAX * w
-                and b - a >= BAND_MIN_ASPECT * text_h]
+                and b - a >= BAND_MIN_ASPECT * min(bottom - top, int(np.ceil(line_px)))]
     if not col_runs:
         return None
     x0, x1 = max(col_runs, key=lambda r: r[1] - r[0])
     density = band[:, x0:x1].mean()
-    # Thin strips right outside the text rows: glyphs of a taller text would cross them.
-    edge = max(2, int(BAND_EDGE * height))
+    # Thin strips right outside the rows: the glyphs of a bigger text cross them.
+    edge = max(2, int(BAND_EDGE * line_px))
     above = mask[max(0, top - edge):top, x0:x1].mean() if top > 0 else 0.0
     below = mask[bottom:bottom + edge, x0:x1].mean() if bottom < h else 0.0
     if density < BAND_DENSITY_MIN or density < BAND_CONTRAST * max(above, below, 1e-6):
         return None
+    by_row = band[:, x0:x1].mean(axis=1)
+    centers = [c * h - top for c in layout["centers"]]
+    for a, b in zip(centers, centers[1:]):  # several rows: there is a gap between them
+        middle, reach = (a + b) / 2, max(1.0, 0.25 * (b - a))
+        if by_row[int(middle - reach):int(middle + reach) + 1].min() > ROW_GAP_DENSITY * density:
+            return None
     return x0 / w, top / h, (x1 - x0) / w, (bottom - top) / h
 
 
@@ -420,10 +573,10 @@ def fill_region(roi: np.ndarray, mask: np.ndarray, soft: np.ndarray, line_px: fl
     return np.clip(estimate * soft + data * (1 - soft), 0, 255).astype(np.uint8)
 
 
-def panel_alpha(w: int, h: int) -> np.ndarray:
+def panel_alpha(w: int, h: int, line_px: float) -> np.ndarray:
     """Rounded-rectangle panel shape (0..1, HxWx1) with a crisp, anti-aliased edge."""
     inset = int(np.ceil(FROST_EDGE_PX * 2))
-    radius = max(2, int(FROST_CORNER * h))
+    radius = max(2, int(FROST_CORNER * min(h, (1 + 2 * PAD_Y) * line_px)))
     x0, y0, x1, y1 = inset, inset, w - 1 - inset, h - 1 - inset
     radius = max(1, min(radius, (x1 - x0) // 2, (y1 - y0) // 2))
     alpha = np.zeros((h, w), np.uint8)
@@ -461,7 +614,7 @@ def process_clip(clip: Path, target: Path, info: dict, box: tuple, region: dict,
         soft_full = cv2.resize(soft_small, (w, h), interpolation=cv2.INTER_LINEAR)[:, :, None]
         ones = np.ones_like(soft_small)
     if method == "panel":
-        alpha_full = panel_alpha(w, h)
+        alpha_full = panel_alpha(w, h, region["line_h"] * info["height"])
 
     decoder = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-i", str(clip), "-vf", f"crop={w}:{h}:{x}:{y}",
@@ -550,20 +703,30 @@ def main() -> int:
             raise CaptionError(f"No <N>.mp4 clips in {sources}")
 
         # Pass 1: candidate caption lines in sampled, downscaled frames of every clip.
-        infos, candidates = {}, {}
+        infos, candidates, masks = {}, {}, {}
         for clip in clips:
             info = probe(clip)
             a_h = int(round(info["height"] * ANALYSIS_WIDTH / info["width"] / 2)) * 2
             sampled = decode(clip, f"fps={SAMPLE_FPS},scale={ANALYSIS_WIDTH}:{a_h}", ANALYSIS_WIDTH, a_h)
             infos[clip.name] = info
-            candidates[clip.name] = [(i / SAMPLE_FPS, box) for i, f in enumerate(sampled) for box in find_lines(f)]
+            texts = [text_mask(f) for f in sampled]
+            candidates[clip.name] = [(i / SAMPLE_FPS, box) for i, m in enumerate(texts) for box in find_lines(m)]
+            masks[clip.name] = [np.packbits(m > 0, axis=1) for m in texts]  # for pass 2, 1 bit per pixel
 
         # Pass 2: keep candidates on the video's caption line.
-        line = dominant_line(candidates)
+        blocks = {}
+        for name, items in candidates.items():
+            by_time: dict[float, list] = {}
+            for t, box in items:
+                by_time.setdefault(t, []).append(box)
+            blocks[name] = [(t, b) for t, boxes in by_time.items() for b in group_rows(boxes)]
+        line = dominant_line(blocks, masks)
+        layouts = caption_layouts(blocks, line) if line else []
         if line is None:
             log("No caption line found; clips are copied unchanged")
         else:
-            log(f"Caption line at {line[0] * 100:.1f}% of the height, line height {line[1] * 100:.1f}%")
+            log(f"Caption line at {line[0] * 100:.1f}% of the height, line height {line[1] * 100:.1f}%, "
+                f"rows: {', '.join(str(m['rows']) for m in layouts)}")
 
         out_dir.mkdir(parents=True, exist_ok=True)
         if preview_dir:
@@ -579,15 +742,11 @@ def main() -> int:
         for clip in clips:
             info = infos[clip.name]
             target = out_dir / clip.name
-            region = clip_region(candidates[clip.name], line, info["duration"]) if line else None
-            detection = "line"
-            if region is None and line:
-                # Fallback: text density inside the known caption band.
-                a_h = int(round(info["height"] * ANALYSIS_WIDTH / info["width"] / 2)) * 2
-                sampled = decode(clip, f"fps={SAMPLE_FPS},scale={ANALYSIS_WIDTH}:{a_h}", ANALYSIS_WIDTH, a_h)
-                found = [(i / SAMPLE_FPS, b) for i, f in enumerate(sampled) if (b := band_boxes(f, line))]
-                region = clip_region(found, line, info["duration"])
-                detection = "band"
+            region = None
+            if line:
+                texts = (np.unpackbits(m, axis=1, count=ANALYSIS_WIDTH) for m in masks[clip.name])
+                bands = [(i / SAMPLE_FPS, *b) for i, m in enumerate(texts) if (b := band_box(m, layouts, line[1]))]
+                region = clip_region(blocks[clip.name], bands, layouts, line[1], info["duration"])
             if region is None:
                 if args.mode != "detect":
                     shutil.copyfile(clip, target)
@@ -600,13 +759,14 @@ def main() -> int:
             if args.mode == "detect":
                 counts["detect"] += 1
                 report["clips"][clip.name] = {
-                    "caption": True, "method": "detect", "glyphs_removed": False, "detection": detection,
+                    "caption": True, "method": "detect", "glyphs_removed": False, "detection": region["detection"],
                     "box": dict(zip(("x", "y", "w", "h"), box)), "text_box": text,
                     "start": region["start"], "end": region["end"], "hits": region["hits"],
+                    "rows": region["rows"],
                 }
                 if preview_dir:
                     save_detect_preview(clip, region, text, preview_dir / f"{clip.stem}.jpg")
-                log(f"{clip.name}: detect ({detection}) text={tuple(text.values())} "
+                log(f"{clip.name}: detect ({region['detection']}) text={tuple(text.values())} "
                     f"{region['start']:.2f}-{region['end']:.2f}s")
                 continue
             scale = ANALYSIS_WIDTH / info["width"]
@@ -622,12 +782,13 @@ def main() -> int:
             process_clip(clip, target, info, box, region, method, mask, scale, preview)
             counts[method] += 1
             report["clips"][clip.name] = {
-                "caption": True, "method": method, "glyphs_removed": mask is not None, "detection": detection,
+                "caption": True, "method": method, "glyphs_removed": mask is not None, "detection": region["detection"],
                 "box": dict(zip(("x", "y", "w", "h"), box)), "text_box": text,
                 "start": region["start"], "end": region["end"], "hits": region["hits"],
+                "rows": region["rows"],
                 "mask_share": None if share is None else round(share, 3),
             }
-            log(f"{clip.name}: {method} ({detection}) box={box} {region['start']:.2f}-{region['end']:.2f}s"
+            log(f"{clip.name}: {method} ({region['detection']}) box={box} {region['start']:.2f}-{region['end']:.2f}s"
                 + ("" if share is None else f" mask={share:.2f}"))
 
         (out_dir / "captions.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
