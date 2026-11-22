@@ -6,6 +6,7 @@ One file per source video, next to scenelog.json / reorder.json
     "scene_detection"  split_video.py  what each scene detector found
     "overlaps"     gemini_reorder.py  runs of consecutive scenes shared by videos
     "source_overlaps"  gemini_reorder.py  passages of the source inside each video
+    "coherence"    gemini_reorder.py  topic blocks of each video
 A step replaces only its own key, so the file keeps what the other steps wrote.
 """
 

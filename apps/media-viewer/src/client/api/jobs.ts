@@ -10,6 +10,8 @@ export const jobsApi = {
 
   downloadUrl: (jobId: string, name: string) => `${jobsApi.videoUrl(jobId, name)}?download=1`,
 
+  reportDownloadUrl: (jobId: string) => `${API_BASE}${jobPath(jobId)}/report?download=1`,
+
   deleteVideos: (jobId: string, names: string[]) =>
     request<DeleteVideosResult>(`${jobPath(jobId)}/videos`, {
       method: "DELETE",

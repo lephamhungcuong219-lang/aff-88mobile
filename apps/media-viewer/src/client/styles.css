@@ -60,6 +60,32 @@ p {
   padding: 24px 0;
 }
 
+.report {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.report pre {
+  margin: 0 0 8px;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.report details {
+  margin-bottom: 8px;
+}
+
+.report summary {
+  cursor: pointer;
+}
+
+.report details pre {
+  margin-top: 8px;
+}
+
 .toolbar {
   position: sticky;
   top: 0;

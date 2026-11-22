@@ -18,6 +18,7 @@ http://localhost:3000/?id=DFWxtX6yNHTW20wS-55          (local)
   `cloudflared tunnel --url http://localhost:3000` (sẽ ra một tên ngẫu nhiên khác, dùng `<tên đó>/?id=...`).
 
 - Xem trước, tải về từng video hoặc các video đã chọn.
+- Đọc báo cáo `output/final/stats.txt` (tóm tắt luôn hiện, chi tiết mở ra khi cần) và tải về; job chưa có thì không hiện.
 - Xoá một hoặc nhiều video final đã chọn.
 - Xoá toàn bộ `media/jobs/<jobId>`; chỉ được phép khi job đã có `output/final` (tránh xoá job đang chạy dở).
 
@@ -40,8 +41,9 @@ App có workspace pnpm riêng (`pnpm-workspace.yaml` trong thư mục này), kh�
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/jobs/:id` | thông tin job + danh sách video final |
+| GET | `/api/jobs/:id` | thông tin job + danh sách video final + nội dung báo cáo (`report`, null nếu chưa có) |
 | GET | `/api/jobs/:id/videos/:name` | stream video (có Range); `?download=1` để tải về |
+| GET | `/api/jobs/:id/report` | báo cáo `stats.txt` (text); `?download=1` để tải về |
 | DELETE | `/api/jobs/:id/videos` | body `{ "names": [...] }`, trả `{ deleted, missing }` |
 | DELETE | `/api/jobs/:id` | xoá cả thư mục job (409 nếu chưa có `output/final`) |
 
@@ -69,5 +71,5 @@ src/
 - **Next.js**: route handler `app/api/jobs/[id]/...` gọi thẳng `JobsService` và `fileResponse`;
   `shared/` và `client/api/` dùng lại nguyên; trang job thành một page component.
 - **Đăng nhập / phân quyền**: thêm middleware trước `app.route("/api", ...)` trong `app.ts`; module mới đặt trong `server/modules/`.
-- **Chưa có auth**: trang public qua `preview.<N8N_HOST>`, ai có link (đoán được job id) đều xem và xoá được.
+- **Chưa có auth**: trang public qua `preview.<N8N_HOST>`, ai có link (đoán được job id) đều xem (kể cả báo cáo) và xoá được.
   Cổng 3000 trực tiếp chỉ mở ở `127.0.0.1`.

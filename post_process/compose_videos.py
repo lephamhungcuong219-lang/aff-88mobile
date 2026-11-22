@@ -40,6 +40,9 @@ The glass panel has ONE fixed size for the whole video (it never grows or shrink
   Text width is measured by rendering it with the real font; when the longest line
   does not fit MAX_PANEL_WIDTH, the video uses a smaller font.
 
+When all videos are done, <output_dir>/stats.txt is written for the person who uploads them
+(final_report.py). A problem with that file is only logged: the videos are fine.
+
 Stdout: 'dir:<absolute output_dir>' on success, or exactly 'fail'.
 Stderr: progress and the reason for a failure (human-readable).
 Exit code: 0 for success, 1 for failure.
@@ -54,6 +57,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+try:  # python -m post_process.compose_videos
+    from post_process import final_report
+except ImportError:  # python post_process/compose_videos.py
+    import final_report
 
 FONT_FILE = Path("/usr/share/fonts/noto/NotoSans-Bold.ttf")
 
@@ -444,6 +452,8 @@ def main() -> int:
             raise ComposeError(f"No videos to compose in {tts_file}")
 
         out_dir.mkdir(parents=True, exist_ok=True)
+        # A report of a previous run must not describe videos that are being replaced.
+        (out_dir / final_report.FILE_NAME).unlink(missing_ok=True)
         with tempfile.TemporaryDirectory() as tmp:
             for video in videos:
                 index = video["video_index"]
@@ -463,6 +473,11 @@ def main() -> int:
         log(f"Unexpected error: {exc!r}")
         print("fail")
         return 1
+
+    try:
+        log(f"Report: {final_report.write_report(tts_file, out_dir)}")
+    except Exception as exc:  # noqa: BLE001 - the videos are done: never fail because of the report
+        log(f"WARNING: could not write {final_report.FILE_NAME}: {exc!r}")
 
     print(f"dir:{out_dir}")
     return 0

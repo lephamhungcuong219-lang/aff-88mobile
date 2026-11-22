@@ -7,6 +7,7 @@ const MIME_TYPES: Record<string, string> = {
   ".m4v": "video/mp4",
   ".webm": "video/webm",
   ".mov": "video/quicktime",
+  ".txt": "text/plain; charset=utf-8",
 };
 
 export interface FileResponseOptions {

@@ -83,11 +83,13 @@ Bước 6 không phụ thuộc bước 4-5: có thể chạy ngay sau bước 3 
 ├── output/
 │   ├── <awemeId>_video_<N>.mp4       video ghép, 4K, còn caption tiếng Trung  [7]
 │   └── final/<awemeId>_video_<N>.mp4 video hoàn chỉnh: giọng đọc + phụ đề    [10]
+│   └── final/stats.txt              báo cáo cho người đăng video            [10]
 └── temp/
     └── <awemeId>/
         ├── sources/<N>.mp4           các cảnh, chất lượng gốc, còn caption    [3]
         ├── scenelog.csv / .json      danh sách cảnh + thời gian               [3]
         ├── stats.json                thống kê: long_scenes, scene_detection [3], overlaps, source_overlaps [5]
+        ├── jump_cuts.json           các cặp cảnh không nối thẳng vào nhau    [3]
         ├── runlog.txt                kết quả dò cảnh của hai bộ dò             [3]
         ├── compressed/<N>.mp4        bản nhỏ 480p có nhãn SCENE N             [4]
         ├── request.json              request gửi Gemini (lên kế hoạch)        [5]
@@ -161,6 +163,20 @@ cạnh nhau không quá 2 × `SCENE_PART_S` = 2,9s nên Gemini được ghép li
 | Input | `input_video`: video từ bước 2; `output_dir`: `<job>/temp/<awemeId>/sources` |
 | Output | `<output_dir>/<N>.mp4`; ở thư mục cha: `scenelog.csv`, `scenelog.json`, `runlog.txt` |
 | stdout | `dir:<output_dir>` rồi một dòng `long_scenes:` / `fail` |
+
+**Cặp cảnh gây giật hình** (`jump_cuts.py` → `jump_cuts.json`): với mỗi cặp cảnh (a, b), so khung cuối của a với khung đầu của b. Cùng
+góc quay, hình gần như giống nhau (chi tiết SIFT khớp, hoặc màu và bố cục giống nhau) thì nối thẳng sẽ bị giật. Không tính: máy đứng yên hẳn mà nội dung đổi rõ (tripod), và hình **trượt ngang rõ**
+(từ 15% bề ngang, gấp đôi độ lệch dọc). Hai cảnh liền nhau của video gốc (n, n+1) không tính. Các phần của một cảnh quay liền đã chia thì chỉ được nối thẳng đúng thứ tự
+(n, n+1); ngược thứ tự hoặc bỏ cách phần luôn là giật.
+
+| Nối thẳng | Kết quả | Vì sao |
+|---|---|---|
+| 20 → 21, hai phần của một cảnh quay liền | mượt, được phép | khung cuối của 20 và khung đầu của 21 là hai khung liền nhau của video gốc |
+| 21 → 20, hoặc bỏ cách phần (19 → 21 khi 19, 20, 21 là ba phần của một cảnh) | giật, cấm | hình quay ngược hoặc nhảy cóc trong cùng cú quay |
+| 19 → 25, cùng góc quay nhưng cách nhau vài giây trong video gốc | giật, cấm | máy hoặc vật đã di chuyển, hình lệch một chút |
+| hai góc quay khác nhau | chuyển cảnh bình thường, được phép | |
+
+Được phép ở đây chỉ là về độ giật; nối n → n+1 vẫn phải theo `REORDER_SOURCE_RUN_MAX_S`. Không ghi được file này thì chỉ báo log.
 
 Dòng `long_scenes:` (cũng ghi vào `stats.json`) thống kê các cảnh dài **từ 3 giây trở lên** (`LONG_SCENE_S`), dạng
 `long_scenes:<số cảnh ≥ 3s>_<tổng số cảnh>-<số thứ tự các cảnh đó, tăng dần, nối bằng _>`;
@@ -256,11 +272,19 @@ Gom stdout của cả hai bước thành một JSON trong n8n: Code node [flows/
 
 **Gửi thống kê lên Discord** (công cụ cho người phát triển, không phải tính năng): nhánh riêng từ node "Nấu các cảnh"
 → Code node [flows/code/discord_stats.js](../flows/code/discord_stats.js) (mode "Run Once for Each Item") đọc
-`stats.json` + `reorder.json`, trả về `content` (tin nhắn ≤ 2000 ký tự: cảnh dài, % trùng từng video, các đoạn trùng, phần trùng với video gốc)
-và `color` (xanh < 20% trùng, vàng < 50%, đỏ ≥ 50%) → node Discord gửi `{{ $json.content }}`.
+`stats.json` + `reorder.json`, trả về `content` (tin nhắn ≤ 2000 ký tự: cảnh dài (tính sau khi chia), cảnh dài đã chia nhỏ, đoạn trùng dài nhất với video gốc của từng video, đoạn trùng dài nhất giữa từng cặp video; một cảnh lẻ cũng là một đoạn)
+và `color` (đỏ khi có đoạn vượt mức tối đa trong `.env`, còn lại xanh) → node Discord gửi `{{ $json.content }}`.
 
-**Số video đầu ra:** `REORDER_TARGET_VIDEOS` trong `.env` (hiện là **4**) = tạo đúng N video; để trống = Gemini tự quyết
-(tối thiểu đủ để dùng hết các cảnh). N được hạ xuống khi video gốc quá ngắn (cần ít nhất thời lượng tối thiểu mỗi video,
+**Ngữ cảnh:** request có kèm **toàn bộ âm thanh gốc** liền mạch của video (`<job>/input/<awemeId>.mp4`, MP3 mono 48k, đặt trước các clip;
+không có file hoặc không có tiếng thì bỏ qua). Gemini chép lời gốc (`source_script`), dịch (`source_script_vi`) và tóm tắt mạch kể
+(`source_story`) trước khi lên kế hoạch; ba mục này lưu trong `reorder.json` và được đưa vào prompt của bước 8. Chỉ là ngữ cảnh, không có
+timestamp và không bị kiểm tra.
+
+**Mạch lạc:** Gemini chia cảnh thành các chủ đề theo nội dung hình (`topics`), rồi dựng mỗi video thành các cụm cùng chủ đề, giữ các cặp
+cảnh liền nhau khi còn trong giới hạn thời lượng. Thống kê từng video (`topic_changes`, `source_neighbours`, các cụm) ở `stats.json` → `coherence`.
+
+**Số video đầu ra:** `REORDER_TARGET_VIDEOS` trong `.env` (hiện là **4**) = tối đa N video, `REORDER_MIN_VIDEOS` (hiện là **3**) = tối thiểu;
+để trống = Gemini tự quyết (tối thiểu đủ để dùng hết các cảnh khi `REORDER_USE_ALL_SCENES=1`). N được hạ xuống khi video gốc quá ngắn (cần ít nhất thời lượng tối thiểu mỗi video,
 mỗi cảnh dùng tối đa `REORDER_MAX_SCENE_USES` lần, cảnh dài hơn `REORDER_MAX_SHARED_RUN_S` chỉ một lần). Khi N video × thời lượng tối đa không chứa hết video gốc (video gốc dài), vẫn giữ N video và
 **bỏ quy tắc dùng hết các cảnh** (Gemini chọn cảnh hay nhất). Các điều chỉnh này ghi trong `reorder.json` → `rules.notes`.
 
@@ -279,6 +303,9 @@ quy tắc dùng lại cảnh bên dưới (chỉ cấm hai video giống hệt n
 | `REORDER_MAX_SCENE_USES` | 2 | một cảnh dùng trong tối đa bao nhiêu video (luôn bắt buộc) |
 | `REORDER_MAX_SHARED_PERCENT` | 50 | độ đa dạng: hai video dùng chung tối đa bao nhiêu % số cảnh của video ngắn hơn; 100 = không giới hạn |
 | `REORDER_MAX_SHARED_RUN_S` | 3 | mỗi đoạn trùng giữa hai video dài tối đa bao nhiêu giây, **luôn áp dụng** dù dùng chung nhiều hay ít; 0 = không giới hạn |
+| `REORDER_USE_ALL_SCENES` | 0 | 1 = mọi cảnh phải được dùng; 0 = chọn cảnh hay và hợp góc |
+| `REORDER_MAX_SWITCH_PERCENT` | 45 | mạch lạc: số chỗ nối đổi chủ đề trong một video, tối đa bao nhiêu %; 100 = không giới hạn |
+| `REORDER_KEEP_TOPICS_TOGETHER` | 1 | đã rời một chủ đề thì không quay lại, trừ cụm mở đầu/kết dài không quá 2 cảnh; 0 = tắt |
 | `REORDER_SOURCE_RUN_TARGET_S` | 2.7 | trùng với **video gốc**: Gemini được yêu cầu giữ mỗi đoạn cảnh số liền nhau (1, 2, 3…) đặt cạnh nhau dưới mức này |
 | `REORDER_SOURCE_RUN_MAX_S` | 2.9 | mức tối đa chấp nhận của đoạn đó (từ 2 cảnh trở lên), quá thì Gemini phải sửa; áp dụng cả khi `TARGET_VIDEO_S=0`; 0 = không giới hạn |
 
@@ -289,21 +316,24 @@ Hai giới hạn độc lập: giây chống hai video có đoạn giống nhau 
 **Ưu tiên khi chỉnh: giảm trùng cảnh giữa các video, nhưng vẫn giữ đủ nội dung.** Mỗi video phải tự đứng được
 (mở đầu, các ý chính của góc tiếp cận, kêu gọi mua), không cắt bớt ý chỉ để né trùng.
 
-Quy tắc kiểm tra (sai thì gửi lỗi lại cho Gemini trong cùng cuộc trò chuyện, tối đa 3 lần):
+Quy tắc kiểm tra (sai thì gửi lỗi lại cho Gemini trong cùng cuộc trò chuyện, tối đa `REORDER_MAX_ATTEMPTS` lần gọi, mặc định 4):
 
 - mỗi video trong khoảng cho phép ở trên (mặc định 10-20 giây, mục tiêu 15 giây);
 - trong một video mỗi cảnh xuất hiện tối đa một lần;
-- đúng `REORDER_TARGET_VIDEOS` video (nếu có đặt);
-- mọi cảnh được dùng ít nhất một lần (trừ khi bị bỏ như trên);
+- từ `REORDER_MIN_VIDEOS` đến `REORDER_TARGET_VIDEOS` video (nếu có đặt; để trống min = đúng số video);
+- mọi cảnh được dùng ít nhất một lần (chỉ khi `REORDER_USE_ALL_SCENES=1`, và trừ khi bị bỏ như trên);
+- mỗi cảnh thuộc đúng một chủ đề (`topics`); từ 10 cảnh trở lên phải có ít nhất 3 chủ đề, không chủ đề nào quá 60% số cảnh;
+- số chỗ nối đổi chủ đề không quá `REORDER_MAX_SWITCH_PERCENT`%, và chủ đề đã rời thì không quay lại (`REORDER_KEEP_TOPICS_TOGETHER`);
 - mỗi cảnh dùng trong tối đa `REORDER_MAX_SCENE_USES` video;
 - hai video dùng chung tối đa `REORDER_MAX_SHARED_PERCENT`% số cảnh của video ngắn hơn;
 - mỗi đoạn trùng giữa hai video dài không quá `REORDER_MAX_SHARED_RUN_S` giây;
-- trong một video, mỗi đoạn từ 2 cảnh có số liền nhau tăng dần (giống video gốc) dài không quá `REORDER_SOURCE_RUN_MAX_S` giây.
+- trong một video, mỗi đoạn từ 2 cảnh có số liền nhau tăng dần (giống video gốc) dài không quá `REORDER_SOURCE_RUN_MAX_S` giây;
+- không nối thẳng hai cảnh trong `jump_cuts.json` (`REORDER_AVOID_JUMP_CUTS=1`, đặt 0 để tắt; job cũ không có file thì bỏ qua).
 
 `reorder.json`:
 ```
 {
-  "model", "product", "aspects": [...], "rules": {...},
+  "model", "product", "source_script", "source_script_vi", "source_story", "aspects": [...], "topics": [{"name", "scenes"}], "rules": {...},
   "source_scene_count", "source_total_duration", "video_count",
   "videos": [{
     "video_index", "angle", "title", "summary", "key_points": [...],
@@ -338,7 +368,10 @@ vật sáng phía sau) thì bước dự phòng dò mật độ pixel chữ, ch�
 **Vị trí caption:** dò toàn khung hình (3-95% chiều cao), nên caption ở trên, giữa hay dưới đều được. Mỗi video có một vị trí:
 nơi có nhiều clip có chữ nhất, mỗi clip tính theo độ rộng chữ. Không được chọn: vị trí có ở dưới 3 clip hoặc dưới 15% số clip, chữ
 hẹp (trung vị dưới 15% bề ngang) hoặc lệch tâm, và chữ không đổi suốt video (tiêu đề/logo cố định, xét khi có từ 5 clip).
-Caption 2-3 dòng được nhận là một khối.
+Caption 2-3 dòng được nhận là một khối; dòng cạnh một dòng bình thường có thể chỉ có 1 chữ.
+
+**Hai mặt nạ chữ:** mặt nạ thường, và mặt nạ chặt chỉ lấy lõi trắng của chữ (nền sáng và chữ có bóng: hai dòng sát nhau không bị dính thành
+một khối). Mỗi video dò bằng cả hai, dùng bên tìm được nhiều dòng caption hơn (bằng nhau thì dùng mặt nạ thường).
 
 **Kích thước vùng chữ:** chiều cao là 1, 2 hoặc 3 dòng tuỳ clip (`rows`), mỗi dòng cao bằng dòng caption (trung vị của các câu bình
 thường trong video, dòng cao 1-6% khung hình); chiều dài là của câu bình thường trong clip. **Chữ to nằm trên dòng caption không
@@ -519,9 +552,14 @@ Video có cảnh caption 2 dòng thì tấm kính cao đủ 2 dòng suốt video
 |---|---|
 | Lệnh | `python -m post_process.compose_videos <tts_json> <videos_dir> <output_dir> [--reorder FILE] [--captions FILE] [--music FILE] [--music-volume 0.12] [--original-volume 0] [--tint dark\|light] [--no-subtitles] [--video N ...] [--height 3840]` |
 | Input | `tts_json`: `.../tts.json`; `videos_dir`: `<job>/output` (tìm `*video_<N>.mp4`); `output_dir`: `<job>/output/final` (phải khác `videos_dir`). Mặc định đọc `reorder.json` cạnh `tts.json` và `clean/captions.json` |
-| Output | `<output_dir>/<tên file như video vào>`: H.264 CRF 20 + AAC 192k, đúng độ dài video vào |
+| Output | `<output_dir>/<tên file như video vào>`: H.264 CRF 20 + AAC 192k, đúng độ dài video vào; `<output_dir>/stats.txt` |
 | stdout | `dir:<output_dir>` / `fail` |
 | Thời gian | khoảng 1 phút 10 giây cho 4 video 4K |
+
+**`stats.txt`** (`final_report.py`): ghi sau khi ghép xong mọi video, cho người đăng video đọc (tiếng Việt, UTF-8). Gồm tóm tắt
+từng video ổn hay cần xem lại, tiêu đề gợi ý, thời lượng, đoạn trùng dài nhất với video gốc và với từng video khác, lời thoại,
+và cảnh báo: đoạn trùng video gốc quá dài, đoạn không dò thấy phụ đề tiếng Trung, thiếu file. Lỗi khi ghi file này chỉ ghi log,
+không làm job thất bại. Trang media-viewer hiện và cho tải file này. Ghi lại cho job cũ: `python -m post_process.final_report <tts_json> <final_dir>` (stdout `txt:<đường dẫn>` / `fail`).
 
 Tuỳ chọn âm thanh: `--music <awemeId>.mp3` thêm nhạc nền (lặp, mờ dần 1 giây cuối) ở `--music-volume`;
 `--original-volume 0.1` giữ tiếng gốc nhỏ. `--tint light` dùng kính sáng (mặc định `dark` để chữ trắng dễ đọc).
@@ -535,7 +573,7 @@ python -m post_process.compose_videos "{{ $json.stdout.trim().replace(/^json:/, 
 
 | Ở đâu | Gì |
 |---|---|
-| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `SCENE_MAX_S`, `SCENE_PART_S`, `SCENE_TRIM_S` (bước 3); `REORDER_TARGET_VIDEOS`, `TARGET_VIDEO_S`, `REORDER_MAX_SCENE_USES`, `REORDER_MAX_SHARED_PERCENT`, `REORDER_MAX_SHARED_RUN_S`, `REORDER_SOURCE_RUN_TARGET_S`, `REORDER_SOURCE_RUN_MAX_S` (bước 5); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
+| `.env` | `GEMINI_API_KEY`, `GEMINI_MODEL` (bước 5, 8); `SCENE_MAX_S`, `SCENE_PART_S`, `SCENE_TRIM_S` (bước 3); `REORDER_TARGET_VIDEOS`, `TARGET_VIDEO_S`, `REORDER_MAX_SCENE_USES`, `REORDER_MAX_SHARED_PERCENT`, `REORDER_MAX_SHARED_RUN_S`, `REORDER_SOURCE_RUN_TARGET_S`, `REORDER_SOURCE_RUN_MAX_S`, `REORDER_AVOID_JUMP_CUTS`, `REORDER_MIN_VIDEOS`, `REORDER_USE_ALL_SCENES`, `REORDER_MAX_SWITCH_PERCENT`, `REORDER_KEEP_TOPICS_TOGETHER`, `REORDER_MAX_ATTEMPTS` (bước 5); `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, `GEMINI_TTS_RPM`, `GEMINI_TTS_VOICES`, `GEMINI_TTS_ACCENT` (bước 9). Đổi `.env` thì phải tạo lại container |
 | `Dockerfile` | Alpine 3.24 (`apk`), ffmpeg, font Noto, Python 3.14, OpenCV/numpy từ `apk`, `uv`, `post_process` copy vào `/opt/post_process` |
 | `docker-compose.yml` | `./media` -> `/data/media`, `./n8n_data` -> `/home/node/.n8n` |
 | Hằng số đầu mỗi script | ngưỡng quy tắc (thời lượng video, số lần dùng cảnh, kích thước caption, tốc độ đọc…) |

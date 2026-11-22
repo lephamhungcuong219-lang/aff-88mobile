@@ -6,14 +6,19 @@ Usage:
 
 Sends every <clips_dir>/<N>.mp4 (small copies from compress_clips.py) to Gemini
 inline as base64, in ONE generateContent request. Each clip is preceded by a
-text label "Scene N", where N is the "Scene Number" in scenelog.json.
+text label "Scene N", where N is the "Scene Number" in scenelog.json. Before the clips
+comes the whole, uncut sound of the source video (<job>/input/<awemeId>.mp4, small mono
+MP3), so Gemini hears complete sentences and the story; without that file or without sound
+the request simply has none. Gemini first writes down the speech ("source_script", with a
+Vietnamese translation) and the story ("source_story"), then plans. Both are saved in
+<output_json> and used again by gemini_voiceover.py.
 
 Gemini plans several output videos, each with its own angle on the product
 (chosen from what the source video actually shows), and returns only the
 ORDER of scene numbers for each one. This script then checks the plan:
     - each video lasts at most MAX_VIDEO_S (target TARGET_VIDEO_S) and at least MIN_VIDEO_S
     - a scene appears at most once inside a video
-    - every scene is used in at least one video
+    - every scene is used in at least one video (only with REORDER_USE_ALL_SCENES=1)
     - a scene is used in at most MAX_SCENE_USES videos
     - two videos share at most MAX_SHARED_RATIO of the smaller one's scenes
       (variety), and every run of consecutive scenes they share lasts at most
@@ -21,6 +26,11 @@ ORDER of scene numbers for each one. This script then checks the plan:
     - a video never plays the source: scenes that follow each other in the source (n, n+1,
       ...) and are next to each other in a video last at most SOURCE_RUN_MAX_S together
       (Gemini is asked for SOURCE_RUN_TARGET_S)
+    - no jump cut: two scenes of the same shot with almost the same picture are never
+      played one right after the other (pairs in jump_cuts.json of split_video.py)
+    - coherence: Gemini first sorts the scenes into topics (what is shown); a video is made
+      of blocks of one topic. At most MAX_SWITCH_RATIO of its joints change the topic, and a
+      topic that was left does not come back (short opening and closing blocks excepted)
 If a rule is broken, the exact problems are sent back to Gemini (same
 conversation, clips included) to fix, up to ANSWER_ATTEMPTS times.
 All timestamps are computed from scenelog.json, never taken from Gemini.
@@ -28,8 +38,13 @@ All timestamps are computed from scenelog.json, never taken from Gemini.
 Environment:
     GEMINI_API_KEY   required (put it in .env)
     GEMINI_MODEL     optional, default below
-    REORDER_TARGET_VIDEOS  optional: make exactly this many videos (see video_policy);
-                     empty = Gemini decides (at least enough to use every scene)
+    REORDER_TARGET_VIDEOS  optional: make at most this many videos (see video_policy);
+                     empty = Gemini decides
+    REORDER_MIN_VIDEOS     optional: ... and at least this many; empty = exactly the target
+    REORDER_USE_ALL_SCENES optional: 1 = every scene must be used, 0 (default) = the best ones
+    REORDER_MAX_SWITCH_PERCENT   optional: MAX_SWITCH_RATIO in percent, default 45; 100 = no limit
+    REORDER_KEEP_TOPICS_TOGETHER optional: 1 (default) = a topic never comes back, 0 = rule off
+    REORDER_MAX_ATTEMPTS         optional: ANSWER_ATTEMPTS, Gemini calls for a valid plan, default 4
     TARGET_VIDEO_S   optional: target length of each video in seconds, default 15
                      (allowed range follows it, see video_length); 0 = the source length
                      is the target (same range formula), and scenes may be shared
@@ -41,6 +56,7 @@ Environment:
     REORDER_SOURCE_RUN_TARGET_S optional: SOURCE_RUN_TARGET_S in seconds, default 2.7
     REORDER_SOURCE_RUN_MAX_S    optional: SOURCE_RUN_MAX_S in seconds, default 2.9
                      (see reuse_limits; also used with TARGET_VIDEO_S=0)
+    REORDER_AVOID_JUMP_CUTS     optional: 1 (default) = no jump cuts, 0 = rule off
 
 Files (next to <output_json>):
     request.json        the request body sent to Gemini (first call; retries
@@ -77,6 +93,7 @@ import base64
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -115,14 +132,23 @@ MAX_SHARED_RUN_S = 3.0   # longest run of consecutive scenes (same scenes, same 
                          # may share, in seconds; 0 = no limit
 # Scenes that follow each other in the source, next to each other in a video: how long
 # such a run may last. The target is asked for, the maximum is checked; 0 = no limit.
+# Coherence, from .env (see coherence_limits)
+USE_ALL_SCENES = False
+MAX_SWITCH_RATIO = 0.45     # joints of a video that may change the topic; 1 = no limit
+KEEP_TOPICS_TOGETHER = True
+EDGE_BLOCK_SCENES = 2       # an opening/closing block of at most this many scenes may show any topic
+MIN_TOPICS, MIN_TOPICS_SCENES = 3, 10  # with at least this many scenes: at least this many topics
+MAX_TOPIC_SHARE = 0.6       # ... and no topic with more than this share of the scenes
+JUMP_CUTS: set[tuple[int, int]] = set()  # (a, b): scene b must not come right after scene a
 SOURCE_RUN_TARGET_S = 2.7
 SOURCE_RUN_MAX_S = 2.9
 
 MAX_INLINE_BYTES = 20 * 1024 * 1024  # documented safe limit for a whole inline request
+AUDIO_BITRATE = "48k"  # source sound sent to Gemini: mono, speech quality
 CLIP_FPS = 6           # clips are ~0.6-2.5 s; the default 1 FPS would see only 1-2 frames
 REQUEST_TIMEOUT_S = 600
 HTTP_ATTEMPTS = 4      # retries on 429 / 5xx / network errors
-ANSWER_ATTEMPTS = 3    # Gemini calls allowed to produce a valid plan
+ANSWER_ATTEMPTS = 4    # Gemini calls allowed to produce a valid plan (REORDER_MAX_ATTEMPTS)
 
 PROMPT = """\
 Bạn là biên tập viên video ngắn chuyên làm nội dung bán hàng trên Douyin/TikTok.
@@ -133,9 +159,18 @@ thực phẩm...): hãy tự nhận biết sản phẩm và những khía cạnh
 chữ trên màn hình và âm thanh.
 Mỗi phân đoạn có nhãn "Scene N" ngay trước nó (và chữ "SCENE N" ở góc hình). N chính là scene_number.
 Các scene đang theo thứ tự gốc: Scene 1 là đầu video, Scene {count} là cuối video.
+{audio_note}
 
 Thời lượng từng scene (giây):
 {durations}
+
+VIỆC ĐẦU TIÊN: hiểu trọn video gốc trước khi lên kế hoạch. Nghe lời nói, đọc phụ đề trên hình, rồi viết:
+- "source_script": nguyên văn TOÀN BỘ lời nói của video gốc, đúng thứ tự. Số liệu và tên riêng phải đúng như nghe được và đúng
+  với phụ đề trên hình; hai bên khác nhau thì theo phụ đề. Không thêm bớt số 0 hay dời dấu thập phân.
+- "source_script_vi": bản dịch tiếng Việt đầy đủ, giữ nguyên mọi số liệu.
+- "source_story": mạch kể của video gốc trong 3-6 câu (mở đầu, vấn đề, sản phẩm, chứng minh từng tính năng, kêu gọi).
+Video không có lời nói thì để "source_script" và "source_script_vi" là chuỗi rỗng.
+Dùng mạch kể này để chia chủ đề, chọn góc, gom cụm và sắp thứ tự cụm: cảnh nào minh hoạ cho ý nào thì đi cùng nhau.
 
 NHIỆM VỤ: từ các scene này, lên kế hoạch cho NHIỀU video ngắn mới để đăng riêng.
 - Mỗi video có MỘT góc tiếp cận (angle) riêng, dựa trên những khía cạnh mà video gốc THỰC SỰ thể hiện.
@@ -146,20 +181,24 @@ NHIỆM VỤ: từ các scene này, lên kế hoạch cho NHIỀU video ngắn m
   vào cùng một video (khi đó ghi rõ các khía cạnh trong "angle"). Điều quan trọng nhất là thời lượng
   của từng video đúng quy tắc bên dưới.
 {count_rule}
+- TRƯỚC HẾT, chia các scene thành 4-8 chủ đề theo NỘI DUNG HÌNH (vật gì, đang làm gì; ví dụ "mở hộp", "đeo lên tai",
+  "màn hình ứng dụng", "cận cảnh hộp sạc"), ghi vào "topics". Mỗi scene thuộc đúng một chủ đề. Các scene của cùng một hành
+  động (bấm nút rồi ra kết quả, mở nắp rồi lấy sản phẩm) phải cùng chủ đề.
 - Mỗi video nên có cấu trúc riêng phù hợp với góc của nó: hook mạnh ở 1-2 giây đầu, phần chính, kết
   (cảnh sản phẩm tổng thể / kêu gọi hành động). Các video phải khác nhau rõ rệt về cảnh mở đầu và thứ tự,
   để người xem không nhận ra chúng được dựng từ cùng một video.
 
 QUY TẮC BẮT BUỘC (sẽ được kiểm tra tự động):
 {length_rule}
-- Trong một video, mỗi scene xuất hiện tối đa một lần.
+{coherence_rule}- Trong một video, mỗi scene xuất hiện tối đa một lần.
 {coverage_rule}
 {reuse_rules}
 - Chỉ trả về scene_number theo thứ tự trong từng video. KHÔNG tự tính timestamp.
-{source_rule}- Giữ cạnh nhau những scene thuộc cùng một hành động/câu nói liên tục nếu tách ra sẽ vô nghĩa,
+{source_rule}{jump_rule}- Giữ cạnh nhau những scene thuộc cùng một hành động/câu nói liên tục nếu tách ra sẽ vô nghĩa,
   miễn là không vi phạm các quy tắc ở trên.
 - "key_points": 2-3 ý chính cụ thể (thông số, lợi ích, điểm khác biệt) mà lời thoại của video đó nên nói,
-  lấy từ những gì video gốc thực sự thể hiện (hình, chữ trên màn hình, lời nói). Không bịa thông số.
+  lấy từ những gì video gốc thực sự thể hiện (hình, chữ trên màn hình, lời nói). Không bịa thông số;
+  số liệu trong "title", "summary", "key_points" phải đúng như trong "source_script" hoặc chữ trên hình.
 - Viết "angle", "title", "summary", "key_points", "description", "reason" bằng tiếng Việt.
 """
 
@@ -168,10 +207,11 @@ Kế hoạch vừa rồi vi phạm quy tắc:
 {problems}
 
 Hãy sửa lại và trả về TOÀN BỘ kế hoạch theo đúng schema, giữ các góc tiếp cận còn hợp lệ.
+Không cần viết lại "source_script", "source_script_vi", "source_story": để chuỗi rỗng (đã có từ lần trước).
 Nếu một video quá ngắn vì góc của nó thiếu cảnh, hãy kết hợp thêm khía cạnh khác vào video đó
-hoặc gộp nó với video khác.
+hoặc gộp nó với video khác. Khi phải tách hai scene, ưu tiên xen scene CÙNG chủ đề để không làm đứt mạch.
 Nhắc lại: {length_fix}, {count_fix}{coverage_fix}
-{reuse_fix}{source_fix}không lặp scene trong cùng một video.
+{coherence_fix}{reuse_fix}{source_fix}{jump_fix}không lặp scene trong cùng một video.
 """
 
 SCENE_ITEM = {
@@ -189,10 +229,26 @@ RESPONSE_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "product": {"type": "STRING", "description": "Sản phẩm được giới thiệu"},
+        "source_script": {"type": "STRING", "description": "Nguyên văn toàn bộ lời nói của video gốc"},
+        "source_script_vi": {"type": "STRING", "description": "Bản dịch tiếng Việt của source_script"},
+        "source_story": {"type": "STRING", "description": "Mạch kể của video gốc, tiếng Việt"},
         "aspects": {
             "type": "ARRAY",
             "items": {"type": "STRING"},
             "description": "Các khía cạnh của sản phẩm mà video gốc thể hiện",
+        },
+        "topics": {
+            "type": "ARRAY",
+            "description": "Chủ đề theo nội dung hình; mỗi scene thuộc đúng một chủ đề",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "name": {"type": "STRING", "description": "Tên chủ đề, ngắn gọn"},
+                    "scenes": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+                },
+                "required": ["name", "scenes"],
+                "propertyOrdering": ["name", "scenes"],
+            },
         },
         "videos": {
             "type": "ARRAY",
@@ -214,8 +270,8 @@ RESPONSE_SCHEMA = {
             },
         },
     },
-    "required": ["product", "aspects", "videos"],
-    "propertyOrdering": ["product", "aspects", "videos"],
+    "required": ["product", "source_script", "source_script_vi", "source_story", "aspects", "topics", "videos"],
+    "propertyOrdering": ["product", "source_script", "source_script_vi", "source_story", "aspects", "topics", "videos"],
 }
 
 
@@ -227,18 +283,52 @@ def log(message: str) -> None:
     print(f"[gemini_reorder] {message}", file=sys.stderr)
 
 
-def target_videos() -> int | None:
-    """REORDER_TARGET_VIDEOS from the environment (.env): number of videos to make, or None."""
-    raw = os.environ.get("REORDER_TARGET_VIDEOS", "").strip()
+def whole_number(name: str) -> int | None:
+    """A whole number of at least 1 from the environment, or None when empty."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
         return None
     try:
         value = int(raw)
     except ValueError as exc:
-        raise ReorderError(f"REORDER_TARGET_VIDEOS must be a whole number: {raw!r}") from exc
+        raise ReorderError(f"{name} must be a whole number: {raw!r}") from exc
     if value < 1:
-        raise ReorderError(f"REORDER_TARGET_VIDEOS must be at least 1: {value}")
+        raise ReorderError(f"{name} must be at least 1: {value}")
     return value
+
+
+def target_videos() -> int | None:
+    """REORDER_TARGET_VIDEOS from the environment (.env): most videos to make, or None."""
+    return whole_number("REORDER_TARGET_VIDEOS")
+
+
+def min_video_count(target: int | None) -> int | None:
+    """REORDER_MIN_VIDEOS: fewest videos to make; empty = exactly the target."""
+    value = whole_number("REORDER_MIN_VIDEOS")
+    return target if value is None or target is None else min(value, target)
+
+
+def switch(name: str, default: bool) -> bool:
+    """A 0/1 setting from the environment."""
+    raw = os.environ.get(name, "").strip()
+    if raw not in ("", "0", "1"):
+        raise ReorderError(f"{name} must be 0 or 1: {raw!r}")
+    return default if raw == "" else raw == "1"
+
+
+def coherence_limits() -> None:
+    """USE_ALL_SCENES, MAX_SWITCH_RATIO and KEEP_TOPICS_TOGETHER from the environment (.env)."""
+    global USE_ALL_SCENES, MAX_SWITCH_RATIO, KEEP_TOPICS_TOGETHER
+    USE_ALL_SCENES = switch("REORDER_USE_ALL_SCENES", False)
+    KEEP_TOPICS_TOGETHER = switch("REORDER_KEEP_TOPICS_TOGETHER", True)
+    raw = os.environ.get("REORDER_MAX_SWITCH_PERCENT", "").strip()
+    try:
+        percent = float(raw) if raw else 45.0
+    except ValueError:
+        percent = -1.0
+    if not 0 <= percent <= 100:
+        raise ReorderError(f"REORDER_MAX_SWITCH_PERCENT must be a number from 0 to 100: {raw!r}")
+    MAX_SWITCH_RATIO = percent / 100
 
 
 def video_length() -> None:
@@ -300,6 +390,22 @@ def reuse_limits() -> None:
         SOURCE_RUN_TARGET_S = min(SOURCE_RUN_TARGET_S or SOURCE_RUN_MAX_S, SOURCE_RUN_MAX_S)
 
 
+def load_jump_cuts(path: Path, scenes: list[dict]) -> None:
+    """Pairs of scenes that must not follow each other (split_video.py); no file = no rule."""
+    global JUMP_CUTS
+    JUMP_CUTS = set()
+    if not switch("REORDER_AVOID_JUMP_CUTS", True):
+        return
+    try:
+        pairs = json.loads(path.read_text(encoding="utf-8"))["pairs"]
+        known = {s["scene_number"] for s in scenes}
+        JUMP_CUTS = {(int(a), int(b)) for a, b in pairs if int(a) in known and int(b) in known}
+    except FileNotFoundError:
+        log(f"{path.name} not found (older job): jump cuts are not checked")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        log(f"WARNING: could not read {path}: {exc!r}; jump cuts are not checked")
+
+
 def use_full_source(scenes: list[dict]) -> None:
     """FULL_SOURCE: the target is the source length; minimum and maximum follow it as in
     video_length (a source of 49 s -> 44..54 s; the maximum cannot be reached without
@@ -322,22 +428,33 @@ def min_videos(scenes: list[dict]) -> int:
 def video_policy(scenes: list[dict], target: int | None) -> dict:
     """How many videos to make, and whether every scene must be used.
 
-    target None: Gemini decides (at least min_videos), every scene used.
-    target N: exactly N videos. N is lowered when the source is too short for N videos of
+    target None: Gemini decides (at least min_videos when every scene must be used).
+    target N: at most N videos and at least min_video_count (default: exactly N).
+    N is lowered when the source is too short for N videos of
     MIN_VIDEO_S (each scene may be reused MAX_SCENE_USES times, except a scene longer than
     MAX_SHARED_RUN_S, which fits in one video only). When N videos of at most
     MAX_VIDEO_S cannot hold every scene (long source), N is kept and the "every scene"
-    rule is dropped: Gemini picks the best scenes.
+    rule is dropped: Gemini picks the best scenes. Without USE_ALL_SCENES it always does.
     """
     total = sum(s["duration"] for s in scenes)
+    least = min_video_count(target)
+
+    def count_texts(most: int) -> dict:
+        fewest = min(least, most)
+        if fewest == most:
+            return {"min_count": most, "count_rule": f"- Tạo ĐÚNG {most} video (không hơn, không kém).",
+                    "count_fix": f"đúng {most} video, "}
+        return {"min_count": fewest, "count_fix": f"từ {fewest} đến {most} video, ", "count_rule": (
+            f"- Tạo từ {fewest} đến {most} video. Ưu tiên {most}, nhưng mỗi video phải có góc riêng với đủ cảnh hợp góc đó;\n"
+            "  thà ít video mà hay, KHÔNG gom cảnh thừa thành một video.")}
+
     if FULL_SOURCE:  # scenes may be reused freely: any count fits, nothing to lower or drop
-        return {"target": target, "count": target, "cover_all": True, "notes": [],
-                "count_rule": (f"- Tạo ĐÚNG {target} video (không hơn, không kém)." if target is not None
-                               else "- Số lượng video do bạn quyết định theo nội dung, tối thiểu 1 video."),
-                "count_fix": f"đúng {target} video, " if target is not None else ""}
-    needed = min_videos(scenes)
+        texts = (count_texts(target) if target is not None else
+                 {"count_rule": "- Số lượng video do bạn quyết định theo nội dung, tối thiểu 1 video.", "count_fix": ""})
+        return {"target": target, "count": target, "cover_all": USE_ALL_SCENES, "notes": [], **texts}
+    needed = min_videos(scenes) if USE_ALL_SCENES else 1
     if target is None:
-        return {"target": None, "count": None, "cover_all": True, "notes": [],
+        return {"target": None, "count": None, "cover_all": USE_ALL_SCENES, "notes": [],
                 "count_rule": f"- Số lượng video do bạn quyết định theo nội dung, tối thiểu {needed} video.",
                 "count_fix": ""}
     notes, count = [], target
@@ -346,13 +463,11 @@ def video_policy(scenes: list[dict], target: int | None) -> dict:
     if count > possible:
         notes.append(f"{target} videos need more footage than {total:.1f}s; making {possible}")
         count = possible
-    cover_all = count >= needed
-    if not cover_all:
+    cover_all = USE_ALL_SCENES and min(least, count) >= needed
+    if USE_ALL_SCENES and not cover_all:
         notes.append(f"{count} videos of at most {MAX_VIDEO_S:.0f}s cannot use all {total:.1f}s: "
                      "the best scenes are picked, not every scene")
-    return {"target": target, "count": count, "cover_all": cover_all, "notes": notes,
-            "count_rule": f"- Tạo ĐÚNG {count} video (không hơn, không kém).",
-            "count_fix": f"đúng {count} video, "}
+    return {"target": target, "count": count, "cover_all": cover_all, "notes": notes, **count_texts(count)}
 
 
 def load_scenes(scenelog: Path) -> list[dict]:
@@ -393,8 +508,8 @@ def rule_values(scenes: list[dict], policy: dict) -> dict:
         coverage_rule = f"- MỌI scene từ 1 đến {n} phải được dùng trong ít nhất một video."
         coverage_fix = f"mọi scene 1-{n} được dùng ít nhất một lần, "
     else:
-        coverage_rule = ("- KHÔNG bắt buộc dùng hết các scene (video gốc dài hơn tổng thời lượng các video): "
-                         "chọn những scene hay nhất cho từng góc tiếp cận.")
+        coverage_rule = ("- KHÔNG bắt buộc dùng hết các scene: chọn những scene hay nhất và hợp nhất cho từng góc, "
+                         "bỏ scene không ăn nhập.")
         coverage_fix = ""
     values = {
         "count": n,
@@ -433,23 +548,79 @@ def rule_values(scenes: list[dict], policy: dict) -> dict:
             f"và KHÔNG ĐƯỢC quá {SOURCE_RUN_MAX_S:g} giây\n"
             f"  (chỉ dùng khoảng {SOURCE_RUN_TARGET_S:g}-{SOURCE_RUN_MAX_S:g} giây khi nhờ vậy video hay hơn hẳn). "
             "Áp dụng cho mọi đoạn từ 2 scene trở lên.\n"
-            "  Muốn cắt đoạn thì xen một scene khác vào giữa hoặc đảo thứ tự (như 2, 1, 3 hoặc 1, 5, 2).\n"
+            "  Đoạn sắp vượt thì nối sang scene khác cùng chủ đề nhưng không liền số (như 1, 2, 5, 6), không chen chủ đề khác.\n"
             "  Trước khi trả lời, hãy rà từng video và cộng thời lượng từng đoạn như vậy.\n")
         values["source_fix"] = (f"mỗi đoạn scene có số liền nhau tăng dần trong một video không quá "
                                 f"{SOURCE_RUN_MAX_S:g} giây (nên dưới {SOURCE_RUN_TARGET_S:g} giây), ")
+    values["coherence_rule"] = (
+        "- MẠCH LẠC (quan trọng nhất với người xem): dựng mỗi video thành các CỤM, mỗi cụm là 2-5 scene CÙNG chủ đề đặt cạnh nhau,\n"
+        "  kể trọn một ý rồi mới sang cụm khác. Trong cụm, giữ các cặp số liền nhau (n rồi n+1) khi còn trong giới hạn thời lượng;\n"
+        "  khi chạm giới hạn thì nhảy sang scene khác CÙNG chủ đề, đừng chen chủ đề khác vào. Hành động phải đi trọn: đã bấm nút\n"
+        "  hay mở nắp thì scene sau phải là kết quả của nó. Thứ tự các cụm theo một mạch kể: mở đầu gây chú ý, vấn đề, sản phẩm,\n"
+        "  chứng minh, kêu gọi.\n")
+    values["coherence_fix"] = "dựng theo cụm cùng chủ đề, hành động đi trọn, "
+    if KEEP_TOPICS_TOGETHER:
+        values["coherence_rule"] += (
+            "- Trong một video, mỗi chủ đề chỉ xuất hiện thành MỘT cụm: đã rời chủ đề thì KHÔNG quay lại (không giới thiệu tính năng\n"
+            f"  một chút, chuyển cảnh khác, rồi quay lại tính năng đó). Chỉ miễn cho cụm mở đầu và cụm kết dài không quá {EDGE_BLOCK_SCENES} scene.\n")
+        values["coherence_fix"] += "đã rời chủ đề thì không quay lại (trừ cụm mở đầu và cụm kết ngắn), "
+    if MAX_SWITCH_RATIO < 1:
+        values["coherence_rule"] += (
+            f"- Trong một video, số chỗ nối đổi chủ đề không quá {MAX_SWITCH_RATIO * 100:g}% số chỗ nối "
+            f"(ví dụ 13 scene có 12 chỗ nối: tối đa {int(MAX_SWITCH_RATIO * 12 + 1e-9)} lần đổi).\n")
+        values["coherence_fix"] += f"đổi chủ đề không quá {MAX_SWITCH_RATIO * 100:g}% số chỗ nối, "
+    values["jump_rule"] = values["jump_fix"] = ""
+    if JUMP_CUTS:
+        after: dict[int, list[int]] = {}
+        for a, b in sorted(JUMP_CUTS):
+            after.setdefault(a, []).append(b)
+        pairs = "\n".join(f"  ngay sau scene {a} KHÔNG được là: {', '.join(map(str, found))}"
+                          for a, found in after.items())
+        values["jump_rule"] = (
+            "- KHÔNG để giật hình. Hai scene cùng góc quay chỉ mượt khi nối tiếp nhau thật trong video gốc: scene n rồi ngay sau\n"
+            "  là n+1 (như 20 rồi 21) thì ĐƯỢC nối thẳng, miễn là đúng giới hạn thời lượng ở trên. Cùng góc quay nhưng thiếu một\n"
+            "  đoạn ở giữa (như 20 rồi 22) hoặc ngược thứ tự (như 21 rồi 20) thì hình nhảy, trông như bị lỗi.\n"
+            f"  Các cặp KHÔNG được nối thẳng trong video này (xen scene khác vào giữa, ưu tiên cùng chủ đề):\n{pairs}\n")
+        values["jump_fix"] = "không nối thẳng hai scene nằm trong danh sách gây giật hình, "
     return values
 
 
-def build_request(scenes: list[dict], clips_dir: Path, policy: dict) -> dict:
+def source_audio(scenelog: Path) -> bytes | None:
+    """The whole sound of the source video as a small mono MP3, or None (not found / no sound)."""
+    video = scenelog.parent.parent.parent / "input" / f"{scenelog.parent.name}.mp4"
+    if not video.is_file():
+        log(f"Source video not found, planning without its whole sound: {video}")
+        return None
+    try:
+        result = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-i", str(video), "-vn", "-ac", "1", "-ar", "24000",
+                                 "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE, "-f", "mp3", "-"],
+                                capture_output=True, check=False)
+    except OSError as exc:
+        log(f"WARNING: could not run ffmpeg, planning without the whole sound: {exc}")
+        return None
+    if result.returncode != 0 or not result.stdout:
+        reason = (result.stderr.decode(errors="replace").strip().splitlines() or ["no sound"])[0][:200]
+        log(f"No sound from {video.name}, planning without it: {reason}")
+        return None
+    return result.stdout
+
+
+def build_request(scenes: list[dict], clips_dir: Path, policy: dict, audio: bytes | None = None) -> dict:
     durations = "\n".join(f"  Scene {s['scene_number']}: {s['duration']:.3f}" for s in scenes)
     prompt = PROMPT.format(
         durations=durations,
         total=sum(s["duration"] for s in scenes),
+        audio_note=("Trước các scene là TOÀN BỘ ÂM THANH của video gốc, liền mạch từ đầu đến cuối: dùng nó để hiểu trọn câu nói và\n"
+                    "mạch kể (âm thanh trong từng scene bị cắt ngang câu)." if audio else ""),
         **rule_values(scenes, policy),
     )
     parts = [{"text": prompt}]
 
     total = 0
+    if audio:
+        total += len(audio)
+        parts += [{"text": "Âm thanh gốc của cả video:"},
+                  {"inlineData": {"mimeType": "audio/mp3", "data": base64.b64encode(audio).decode("ascii")}}]
     for s in scenes:
         clip = clips_dir / f"{s['scene_number']}.mp4"
         if not clip.is_file():
@@ -464,7 +635,7 @@ def build_request(scenes: list[dict], clips_dir: Path, policy: dict) -> dict:
     parts.append({"text": f"Hết {len(scenes)} scene. Trả về kế hoạch theo đúng schema."})
 
     encoded = total * 4 // 3
-    log(f"{len(scenes)} clips, {total / 1e6:.1f} MB raw, ~{encoded / 1e6:.1f} MB as base64")
+    log(f"{len(scenes)} clips{f' + whole sound ({len(audio) / 1e3:.0f} kB)' if audio else ''}, {total / 1e6:.1f} MB raw, ~{encoded / 1e6:.1f} MB as base64")
     if encoded > MAX_INLINE_BYTES:
         raise ReorderError(
             f"Inline request too large (~{encoded / 1e6:.1f} MB > 20 MB). "
@@ -563,6 +734,88 @@ def source_runs(plan: list[int]) -> list[list[int]]:
     return [run for run in runs if len(run) > 1]
 
 
+def read_topics(answer: dict, durations: dict[int, float]) -> tuple[dict[int, str], list[str]]:
+    """({scene: topic name}, problems) of the answer's "topics"."""
+    if MAX_SWITCH_RATIO >= 1 and not KEEP_TOPICS_TOGETHER:
+        return {}, []  # nothing depends on them
+    topics: dict[int, str] = {}
+    twice, sizes = set(), {}
+    for item in answer.get("topics") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip() or f"chủ đề {len(sizes) + 1}"
+        for number in item.get("scenes") or []:
+            if number not in durations:
+                continue
+            if number in topics and topics[number] != name:
+                twice.add(number)
+            topics.setdefault(number, name)
+        sizes[name] = sum(t == name for t in topics.values())
+    problems = []
+    missing = [n for n in durations if n not in topics]
+    if missing:
+        problems.append(f"Scene chưa thuộc chủ đề nào trong 'topics': {missing}.")
+    if twice:
+        problems.append(f"Scene thuộc nhiều chủ đề (chỉ được một): {sorted(twice)}.")
+    if len(durations) >= MIN_TOPICS_SCENES and topics:
+        biggest = max(sizes, key=lambda t: sizes[t])
+        if len(sizes) < MIN_TOPICS:
+            problems.append(f"Chỉ có {len(sizes)} chủ đề, cần ít nhất {MIN_TOPICS} (chia theo nội dung hình).")
+        elif sizes[biggest] > MAX_TOPIC_SHARE * len(durations):
+            problems.append(f"Chủ đề '{biggest}' có {sizes[biggest]}/{len(durations)} scene, quá rộng: hãy chia nhỏ theo nội dung hình.")
+    return topics, problems
+
+
+def topic_blocks(plan: list[int], topics: dict[int, str]) -> list[tuple[str, list[int]]]:
+    """A plan as blocks of neighbouring scenes of one topic."""
+    blocks: list[tuple[str, list[int]]] = []
+    for number in plan:
+        topic = topics.get(number, f"scene {number}")
+        if blocks and blocks[-1][0] == topic:
+            blocks[-1][1].append(number)
+        else:
+            blocks.append((topic, [number]))
+    return blocks
+
+
+def coherence_problems(index: int, plan: list[int], topics: dict[int, str]) -> list[str]:
+    """Too many topic changes, or a topic that was left and comes back."""
+    blocks = topic_blocks(plan, topics)
+    if not topics or len(blocks) < 3:
+        return []
+    shown = " | ".join(f"{topic}: {', '.join(map(str, scenes))}" for topic, scenes in blocks)
+    problems = []
+    joints, changes = len(plan) - 1, len(blocks) - 1
+    allowed = int(MAX_SWITCH_RATIO * joints + 1e-9)
+    if changes > allowed:
+        problems.append(f"Video {index}: rời rạc, đổi chủ đề {changes}/{joints} chỗ nối (tối đa {allowed}). "
+                        f"Các cụm hiện tại: {shown}. Hãy gom scene cùng chủ đề lại cạnh nhau.")
+    if KEEP_TOPICS_TOGETHER:
+        first = 1 if len(blocks[0][1]) <= EDGE_BLOCK_SCENES else 0
+        last = len(blocks) - 1 if len(blocks[-1][1]) <= EDGE_BLOCK_SCENES else len(blocks)
+        names = [topic for topic, _ in blocks[first:last]]
+        back = sorted({t for t in names if names.count(t) > 1})
+        if back:
+            problems.append(f"Video {index}: rời chủ đề rồi quay lại: {', '.join(back)}. Các cụm hiện tại: {shown}. "
+                            "Hãy gom mỗi chủ đề thành một cụm liền.")
+    return problems
+
+
+def coherence_stats(videos: list[dict], topics: dict[int, str]) -> dict:
+    """How coherent the final plan is (stats.json -> "coherence")."""
+    per_video = []
+    for video in videos:
+        plan = [s["scene_number"] for s in video["scenes"]]
+        blocks = topic_blocks(plan, topics)
+        per_video.append({
+            "video_index": video["video_index"], "joints": len(plan) - 1,
+            "topic_changes": len(blocks) - 1 if topics else None,
+            "source_neighbours": sum(b == a + 1 for a, b in zip(plan, plan[1:])),
+            "blocks": [{"topic": topic, "scenes": scenes} for topic, scenes in blocks] if topics else [],
+        })
+    return {"max_switch_percent": round(MAX_SWITCH_RATIO * 100, 1), "per_video": per_video}
+
+
 def find_problems(answer: dict, scenes: list[dict], policy: dict) -> list[str]:
     """Check the plan against the rules; return human-readable problems (empty = valid)."""
     durations = {s["scene_number"]: s["duration"] for s in scenes}
@@ -570,9 +823,13 @@ def find_problems(answer: dict, scenes: list[dict], policy: dict) -> list[str]:
     if not isinstance(videos, list) or not videos:
         return ["Không có danh sách 'videos'."]
 
-    problems, plans = [], []
-    if policy["count"] is not None and len(videos) != policy["count"]:
-        problems.append(f"Có {len(videos)} video, yêu cầu đúng {policy['count']} video.")
+    plans = []
+    topics, problems = read_topics(answer, durations)
+    if policy["count"] is not None:
+        least = policy.get("min_count", policy["count"])
+        if not least <= len(videos) <= policy["count"]:
+            wanted = f"đúng {least}" if least == policy["count"] else f"từ {least} đến {policy['count']}"
+            problems.append(f"Có {len(videos)} video, yêu cầu {wanted} video.")
     for index, video in enumerate(videos, start=1):
         items = video.get("scenes") if isinstance(video, dict) else None
         if not isinstance(items, list) or not items:
@@ -600,8 +857,14 @@ def find_problems(answer: dict, scenes: list[dict], policy: dict) -> list[str]:
             if long_passages:
                 problems.append(
                     f"Video {index}: đoạn giống hệt video gốc dài quá {SOURCE_RUN_MAX_S:g}s: {', '.join(long_passages)}. "
-                    "Hãy xen scene khác vào giữa hoặc đảo thứ tự các scene trong đoạn."
+                    "Hãy cắt đoạn bằng scene khác, ưu tiên scene cùng chủ đề."
                 )
+
+        problems += coherence_problems(index, valid, topics)
+        jumps = [f"{a}-{b}" for a, b in zip(valid, valid[1:]) if (a, b) in JUMP_CUTS]
+        if jumps:
+            problems.append(f"Video {index}: nối thẳng hai scene cùng góc quay nhưng không nối tiếp nhau trong video gốc "
+                            f"nên bị giật hình: {', '.join(jumps)}. Hãy xen scene khác vào giữa, ưu tiên cùng chủ đề.")
 
     uses = {n: [i for i, plan in enumerate(plans, start=1) if n in plan] for n in durations}
     unused = [n for n, where in uses.items() if not where]
@@ -633,6 +896,9 @@ def find_problems(answer: dict, scenes: list[dict], policy: dict) -> list[str]:
                     "Hãy đổi thứ tự hoặc xen scene khác để cắt ngắn các đoạn này."
                 )
     return problems
+
+
+SOURCE_KEYS = ("source_script", "source_script_vi", "source_story")  # what the source says; context only
 
 
 def build_output(answer: dict, scenes: list[dict], model: str, policy: dict) -> dict:
@@ -673,7 +939,9 @@ def build_output(answer: dict, scenes: list[dict], model: str, policy: dict) -> 
     return {
         "model": model,
         "product": answer.get("product", ""),
+        **{key: str(answer.get(key) or "").strip() for key in SOURCE_KEYS},
         "aspects": answer.get("aspects", []),
+        "topics": answer.get("topics", []),
         "rules": {
             "full_source": FULL_SOURCE,
             "target_video_s": round(TARGET_VIDEO_S, 3),
@@ -684,8 +952,12 @@ def build_output(answer: dict, scenes: list[dict], model: str, policy: dict) -> 
             "max_shared_run_s": None if FULL_SOURCE else MAX_SHARED_RUN_S,
             "source_run_target_s": SOURCE_RUN_TARGET_S,
             "source_run_max_s": SOURCE_RUN_MAX_S,
+            "jump_cut_pairs": len(JUMP_CUTS),
+            "max_switch_ratio": MAX_SWITCH_RATIO,
+            "keep_topics_together": KEEP_TOPICS_TOGETHER,
             "target_videos": policy["target"],
             "videos_required": policy["count"],
+            "videos_min": policy.get("min_count", policy["count"]),
             "all_scenes_used_required": policy["cover_all"],
             "notes": policy["notes"],
         },
@@ -819,6 +1091,7 @@ def plan_videos(body: dict, scenes: list[dict], model: str, api_key: str, respon
     """
     log_data = {"model": model, "attempts": []}
     problems: list[str] = []
+    source: dict[str, str] = {}  # SOURCE_KEYS of the first answer that has them (fixes leave them empty)
 
     def record(entry: dict) -> None:
         log_data["attempts"].append(entry)
@@ -844,10 +1117,13 @@ def plan_videos(body: dict, scenes: list[dict], model: str, api_key: str, respon
             record({**entry, "problems": problems})
             continue  # nothing usable to correct; ask again from scratch
 
+        for key in SOURCE_KEYS:
+            source.setdefault(key, "")
+            source[key] = source[key] or str(answer.get(key) or "").strip()
         problems = find_problems(answer, scenes, policy)
         if not problems:
             record({**entry, "accepted": True, "problems": []})
-            return answer
+            return {**answer, **source}
         log("Plan breaks the rules:\n  " + "\n  ".join(problems))
         fix = FIX_PROMPT.format(problems="\n".join(f"- {p}" for p in problems), **rule_values(scenes, policy))
         record({**entry, "problems": problems, "fix_prompt": fix})
@@ -856,6 +1132,7 @@ def plan_videos(body: dict, scenes: list[dict], model: str, api_key: str, respon
 
 
 def main() -> int:
+    global ANSWER_ATTEMPTS
     parser = argparse.ArgumentParser(description="Plan several short videos from Douyin product video scenes.")
     parser.add_argument("scenelog_json", type=Path, help="scenelog.json from split_video.py")
     parser.add_argument("clips_dir", type=Path, help="Directory with compressed <N>.mp4 clips")
@@ -875,6 +1152,8 @@ def main() -> int:
             raise ReorderError(f"output_json must not be named {output.name}")
         video_length()  # before load_scenes: it checks scenes against MAX_VIDEO_S
         reuse_limits()
+        coherence_limits()
+        ANSWER_ATTEMPTS = whole_number("REORDER_MAX_ATTEMPTS") or ANSWER_ATTEMPTS
         scenes = load_scenes(scenelog)
         if FULL_SOURCE:
             use_full_source(scenes)
@@ -885,10 +1164,15 @@ def main() -> int:
             log(f"Reuse: a scene in at most {MAX_SCENE_USES} videos, {MAX_SHARED_RATIO * 100:g}% shared scenes, "
                 f"shared runs of at most {MAX_SHARED_RUN_S:g}s (0 = no limit)")
         log(f"Source passages: target {SOURCE_RUN_TARGET_S:g}s, at most {SOURCE_RUN_MAX_S:g}s (0 = no limit)")
+        load_jump_cuts(scenelog.with_name("jump_cuts.json"), scenes)
+        log(f"Jump cuts: {len(JUMP_CUTS)} pairs of scenes must not follow each other")
+        log(f"Coherence: at most {MAX_SWITCH_RATIO * 100:g}% of the joints change the topic, "
+            f"topics kept together: {'yes' if KEEP_TOPICS_TOGETHER else 'no'}, "
+            f"every scene used: {'yes' if USE_ALL_SCENES else 'no'}")
         policy = video_policy(scenes, target_videos())
         for note in policy["notes"]:
             log(f"REORDER_TARGET_VIDEOS: {note}")
-        body = build_request(scenes, clips_dir, policy)
+        body = build_request(scenes, clips_dir, policy, source_audio(scenelog))
         output.parent.mkdir(parents=True, exist_ok=True)
         write_json(request_file, body)
 
@@ -906,6 +1190,7 @@ def main() -> int:
         stats_file = stats_path(output.parent)
         update_stats(stats_file, "overlaps", None)
         update_stats(stats_file, "source_overlaps", None)
+        update_stats(stats_file, "coherence", None)
 
         answer = plan_videos(body, scenes, model, api_key, response_file, policy)
         result = build_output(answer, scenes, model, policy)
@@ -915,6 +1200,8 @@ def main() -> int:
         write_json(output, result)
         update_stats(stats_file, "overlaps", overlaps)
         update_stats(stats_file, "source_overlaps", source_overlaps)
+        topics, _ = read_topics(answer, {s["scene_number"]: s["duration"] for s in scenes})
+        update_stats(stats_file, "coherence", coherence_stats(result["videos"], topics))
     except ReorderError as exc:
         log_error(exc)
         print("fail")

@@ -4,12 +4,16 @@ import path from "node:path";
 import {
   isVideoFileName,
   parseJobId,
+  REPORT_FILE_NAME,
   type DeleteVideosResult,
   type FinalVideoDto,
   type JobDto,
   type JobRef,
 } from "../../../shared/jobs.js";
 import { badRequest, conflict, notFound } from "../../common/errors.js";
+
+/** Báo cáo chỉ vài KB; file lớn hơn thì không phải báo cáo, không đọc vào bộ nhớ. */
+const MAX_REPORT_BYTES = 256 * 1024;
 
 export interface VideoFile {
   name: string;
@@ -32,7 +36,8 @@ export class JobsService {
     const finalDir = this.finalDir(ref);
     const hasFinal = await isDirectory(finalDir);
     const videos = hasFinal ? await this.listVideos(finalDir) : [];
-    return { ...ref, hasFinal, videos };
+    const report = hasFinal ? await this.readReport(finalDir) : null;
+    return { ...ref, hasFinal, videos, report };
   }
 
   async getVideo(rawId: string, name: string): Promise<VideoFile> {
@@ -40,6 +45,13 @@ export class JobsService {
     const stat = await lstatOrNull(filePath);
     if (!stat?.isFile()) throw notFound(`Không tìm thấy video "${name}"`);
     return { name, path: filePath, size: stat.size, modifiedAt: stat.mtime };
+  }
+
+  async getReport(rawId: string): Promise<VideoFile> {
+    const filePath = path.join(this.finalDir(this.ref(rawId)), REPORT_FILE_NAME);
+    const stat = await lstatOrNull(filePath);
+    if (!stat?.isFile()) throw notFound("Job chưa có báo cáo stats.txt");
+    return { name: REPORT_FILE_NAME, path: filePath, size: stat.size, modifiedAt: stat.mtime };
   }
 
   async deleteVideos(rawId: string, names: unknown): Promise<DeleteVideosResult> {
@@ -100,6 +112,18 @@ export class JobsService {
 
   private async assertJobExists(ref: JobRef): Promise<void> {
     if (!(await isDirectory(this.jobDir(ref)))) throw notFound(`Không tìm thấy job ${ref.id}`);
+  }
+
+  private async readReport(finalDir: string): Promise<string | null> {
+    const filePath = path.join(finalDir, REPORT_FILE_NAME);
+    const stat = await lstatOrNull(filePath);
+    if (!stat?.isFile() || stat.size > MAX_REPORT_BYTES) return null;
+    try {
+      const text = await fs.readFile(filePath, "utf8");
+      return text.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim() || null;
+    } catch {
+      return null; // bị xoá giữa chừng; thiếu báo cáo không được làm hỏng trang
+    }
   }
 
   private async listVideos(finalDir: string): Promise<FinalVideoDto[]> {

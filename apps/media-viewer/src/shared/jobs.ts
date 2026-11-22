@@ -31,6 +31,9 @@ export function isVideoFileName(name: string): boolean {
   return VIDEO_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
+/** Báo cáo cho người đăng video, do post_process/final_report.py ghi cạnh các video final. */
+export const REPORT_FILE_NAME = "stats.txt";
+
 export interface FinalVideoDto {
   name: string;
   /** byte */
@@ -43,6 +46,8 @@ export interface JobDto extends JobRef {
   /** Đã có thư mục output/final, tức pipeline đã tới bước dựng video hoàn chỉnh. */
   hasFinal: boolean;
   videos: FinalVideoDto[];
+  /** Nội dung stats.txt, null khi job chưa có (job cũ, hoặc đang dựng). */
+  report: string | null;
 }
 
 export interface DeleteVideosRequest {

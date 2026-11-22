@@ -29,6 +29,8 @@ Files:
     <output_dir>/../runlog.txt
     <output_dir>/../scenelog.csv
     <output_dir>/../scenelog.json
+    <output_dir>/../jump_cuts.json  pairs of scenes that must not follow each other directly
+                                  (jump_cuts.py; read by gemini_reorder.py)
     <output_dir>/../stats.json    "long_scenes" and "scene_detection" (job_stats.py); written
                                   fresh on every run
 """
@@ -47,9 +49,10 @@ from scenedetect import AdaptiveDetector, FrameTimecode, detect
 from scenedetect.output import write_scene_list
 
 try:  # python -m post_process.split_video
-    from post_process import scene_cuts
+    from post_process import jump_cuts, scene_cuts
     from post_process.job_stats import stats_path, update_stats
 except ImportError:  # python post_process/split_video.py
+    import jump_cuts
     import scene_cuts
     from job_stats import stats_path, update_stats
 
@@ -179,7 +182,10 @@ def find_scenes(video: Path) -> tuple[list[tuple[FrameTimecode, FrameTimecode]],
         "opencv_cuts_added": [round(t, 3) for t in added],
         "dissolves": [[round(a, 3), round(b, 3)] for a, b in dissolves],
         "max_scene_s": max_s,
-        "long_shots_split": long_split,
+        # With the numbers of the scenes each long shot was cut into.
+        "long_shots_split": [{**shot, "scenes": [n for n, (a, b) in enumerate(scenes, 1)
+                                                 if shot["start"] - 2e-3 <= a and b <= shot["end"] + 2e-3]}
+                             for shot in long_split],
         "scene_count": len(scenes),
     }
     # PySceneDetect's own timecodes are kept where nothing changed (no rounding).
@@ -243,6 +249,8 @@ def main() -> int:
         # Ensure a successful run creates fresh scene CSV/JSON files.
         csv.unlink(missing_ok=True)
         json_file.unlink(missing_ok=True)
+        jump_file = meta_dir / jump_cuts.FILE_NAME
+        jump_file.unlink(missing_ok=True)  # pairs of other scenes must never be used
 
         # Remove clips from a previous run (1.mp4, 002.mp4, ...) so stale
         # scenes don't linger when the new run yields fewer scenes.
@@ -271,6 +279,14 @@ def main() -> int:
             scenes = csv_to_json(csv, json_file)
         except Exception:
             return fail(f"Could not convert {csv} to JSON", log, traceback.format_exc())
+
+        # Only a help for gemini_reorder: without the file that rule is not applied.
+        try:
+            pairs = jump_cuts.find_jump_cuts(output, [s["scenes"] for s in report["long_shots_split"]])
+            jump_file.write_text(json.dumps({"pairs": pairs}), encoding="utf-8")
+            report["jump_cut_pairs"] = len(pairs)
+        except Exception:
+            print(f"[split_scenes] WARNING: could not look for jump cuts\n{traceback.format_exc()}", file=sys.stderr)
 
         try:
             stats = long_scene_stats(scenes)

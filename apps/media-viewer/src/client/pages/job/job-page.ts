@@ -1,4 +1,4 @@
-import { parseJobId, type FinalVideoDto, type JobDto } from "../../../shared/jobs";
+import { parseJobId, REPORT_FILE_NAME, type FinalVideoDto, type JobDto } from "../../../shared/jobs";
 import { ApiError } from "../../api/http";
 import { jobsApi } from "../../api/jobs";
 import { formatBytes, formatDate, h } from "../../lib/dom";
@@ -56,6 +56,7 @@ class JobPage {
         h("p", { class: "meta" }, `Workflow ${job.workflowId} · Run ${job.runId}`),
         this.summary,
       ),
+      ...(job.report ? [this.report(job.report)] : []),
       h(
         "div",
         { class: "toolbar" },
@@ -80,6 +81,20 @@ class JobPage {
     );
     this.grid.replaceChildren(...this.videos.map((v) => this.card(v)));
     this.refresh();
+  }
+
+  /** Báo cáo: phần tóm tắt luôn hiện, chi tiết từng video (sau dòng === đầu tiên) mở ra khi cần. */
+  private report(text: string): HTMLElement {
+    const split = text.search(/^={3,}$/m);
+    const head = (split < 0 ? text : text.slice(0, split)).trim();
+    const details = split < 0 ? "" : text.slice(split).trim();
+    return h(
+      "section",
+      { class: "report" },
+      h("pre", {}, head),
+      details ? h("details", {}, h("summary", {}, "Chi tiết từng video"), h("pre", {}, details)) : null,
+      h("a", { href: jobsApi.reportDownloadUrl(this.job.id), download: REPORT_FILE_NAME }, `Tải ${REPORT_FILE_NAME}`),
+    );
   }
 
   private card(video: FinalVideoDto): HTMLLIElement {

@@ -8,6 +8,7 @@ import type { JobsService } from "./jobs.service.js";
  * REST API của job, mount tại /api/jobs.
  *   GET    /:id                 thông tin job + danh sách video final
  *   GET    /:id/videos/:name    stream video (hỗ trợ Range); ?download=1 để tải về
+ *   GET    /:id/report          báo cáo stats.txt; ?download=1 để tải về
  *   DELETE /:id/videos          body { names: string[] }: xoá các video final đã chọn
  *   DELETE /:id                 xoá toàn bộ thư mục job
  */
@@ -22,6 +23,16 @@ export function jobsRoutes(jobs: JobsService) {
         method: c.req.method,
         range: c.req.header("range"),
         downloadName: c.req.query("download") ? video.name : undefined,
+      });
+    })
+
+    .get("/:id/report", async (c) => {
+      const report = await jobs.getReport(c.req.param("id"));
+      return fileResponse({
+        ...report,
+        method: c.req.method,
+        range: c.req.header("range"),
+        downloadName: c.req.query("download") ? report.name : undefined,
       });
     })
 

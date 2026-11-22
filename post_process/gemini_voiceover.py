@@ -8,8 +8,9 @@ Usage:
 For every video in reorder.json, its proxy <proxy_dir>/*video_<N>.mp4 (the light
 copy with the original captions, from render_videos.py --proxy-dir) is sent to
 Gemini inline, together with what the planning step already knows: product,
-aspects, the video's angle/title/summary/key_points and its scene list with
-timings. One request per video.
+aspects, the speech and story of the source video ("source_script", "source_story" in
+reorder.json; older plans have none), the video's angle/title/summary/key_points and its
+scene list with timings. One request per video.
 
 Gemini returns the voice-over as short subtitle-sized segments (no timestamps
 yet), each in two forms:
@@ -84,7 +85,7 @@ Thông tin đã phân tích từ video gốc:
 - Tiêu đề gợi ý: {title}
 - Ý tưởng dựng: {summary}
 - Ý chính cần nói: {key_points}
-
+{source_context}
 Các cảnh theo thứ tự (giây trong video này):
 {scenes}
 
@@ -107,6 +108,8 @@ QUY TẮC BẮT BUỘC (sẽ được kiểm tra tự động):
   KHÔNG thêm, bớt hay đổi bất kỳ chữ tiếng Việt nào: người xem nghe "spoken" và đọc "text" cùng lúc,
   khác một chữ là lệch. Cần dài hơn thì viết thêm đoạn mới, không kéo dài "spoken".
 - Chỉ dùng thông tin có trong video (hình, chữ, lời nói). Không bịa thông số, không hứa hẹn quá mức.
+- Số liệu (thông số, thời gian, phiên bản) và tên sản phẩm phải ĐÚNG NHƯ lời gốc hoặc chữ trên hình, không thêm bớt số 0
+  hay dời dấu thập phân. "Tiêu đề gợi ý" và "Ý chính" ở trên mà khác lời gốc thì theo lời gốc. Không chắc thì không nêu con số.
 - Không nêu giá bằng tệ/nhân dân tệ hay quy đổi tiền; có thể nói chung kiểu "giá cực mềm".
 - "tts_style": một câu tiếng Anh mô tả cách đọc cho máy đọc (Gemini TTS), ví dụ
   "Speak Vietnamese in an upbeat, energetic, friendly sales tone, fairly fast."
@@ -193,6 +196,24 @@ def find_proxy(proxy_dir: Path, index: int) -> Path:
     return matches[0]
 
 
+def source_context(plan: dict) -> str:
+    """What the source video says, as context for the prompt; "" when the plan has none."""
+    script = str(plan.get("source_script") or "").strip()
+    vietnamese = str(plan.get("source_script_vi") or "").strip()
+    story = str(plan.get("source_story") or "").strip()
+    lines = []
+    if story:
+        lines.append(f"- Mạch kể của video gốc: {story}")
+    if script:
+        lines.append(f"- Toàn bộ lời gốc của CẢ video gốc: {script}")
+    if vietnamese:
+        lines.append(f"- Bản dịch lời gốc: {vietnamese}")
+    if not lines:
+        return ""
+    return ("\n".join(lines) + "\n  (Chỉ để hiểu sản phẩm và lấy đúng số liệu. KHÔNG dịch lại từng câu, KHÔNG kể theo thứ tự này: "
+            "video của bạn\n  chỉ dùng một phần cảnh, hãy nói về đúng những cảnh đang có.)\n")
+
+
 def build_request(plan: dict, video: dict, proxy: Path, limits: dict) -> dict:
     scenes = "\n".join(
         f"  {s['out_start']:.1f}-{s['out_end']:.1f}s: {s.get('description') or '(không mô tả)'}"
@@ -206,6 +227,7 @@ def build_request(plan: dict, video: dict, proxy: Path, limits: dict) -> dict:
         title=video.get("title") or "(chưa rõ)",
         summary=video.get("summary") or "(chưa rõ)",
         key_points="; ".join(video.get("key_points") or []) or "(tự chọn từ nội dung video)",
+        source_context=source_context(plan),
         scenes=scenes or "  (không có)",
         **limits,
     )

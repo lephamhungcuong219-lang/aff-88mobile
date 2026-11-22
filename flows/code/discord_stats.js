@@ -17,19 +17,33 @@ const readJson = (file) => {
   }
 };
 const sec = (s) => `${Number(s).toFixed(2)}s`;
-const pct = (r) => `${Math.round(r * 100)}%`;
 
-/** [21..47, 1, 2, 3, 9, 8] -> "21–47, 1–3, 9, 8": dãy tăng liên tiếp từ 3 cảnh được rút gọn, giữ thứ tự. */
-function sceneList(scenes) {
-  const parts = [];
-  for (let i = 0; i < scenes.length;) {
-    let j = i;
-    while (j + 1 < scenes.length && scenes[j + 1] === scenes[j] + 1) j++;
-    if (j - i >= 2) parts.push(`${scenes[i]}–${scenes[j]}`);
-    else parts.push(...scenes.slice(i, j + 1).map(String));
-    i = j + 1;
+/** Đoạn dài nhất giống nhau giữa hai danh sách cảnh (cùng cảnh, cùng thứ tự; một cảnh lẻ cũng là một đoạn), tính bằng giây. */
+function longestShared(a, b) {
+  const numbers = b.map((s) => s.scene_number);
+  let best = 0;
+  for (let i = 0; i < a.length; i++) {
+    const j = numbers.indexOf(a[i].scene_number);
+    if (j < 0) continue;
+    let seconds = 0;
+    for (let k = 0; i + k < a.length && j + k < b.length && a[i + k].scene_number === numbers[j + k]; k++) {
+      seconds += a[i + k].duration;
+    }
+    best = Math.max(best, seconds);
   }
-  return parts.join(', ');
+  return best;
+}
+
+/** Đoạn dài nhất giống video gốc: các cảnh số liền nhau đặt cạnh nhau (một cảnh lẻ cũng là một đoạn), tính bằng giây. */
+function longestSource(scenes) {
+  let best = 0;
+  let seconds = 0;
+  scenes.forEach((s, i) => {
+    const next = i > 0 && s.scene_number === scenes[i - 1].scene_number + 1;
+    seconds = next ? seconds + s.duration : s.duration;
+    best = Math.max(best, seconds);
+  });
+  return best;
 }
 
 // --- Đọc dữ liệu -------------------------------------------------------------
@@ -52,52 +66,60 @@ const rules = plan?.rules;
 if (plan) {
   const target = rules?.full_source ? `dài bằng video gốc (${sec(rules.target_video_s)})`
     : `mục tiêu ${rules?.target_video_s}s (${rules?.min_video_s}-${rules?.max_video_s}s)`;
-  lines.push(`${plan.video_count} video · ${target}`);
+  lines.push(`- ${plan.video_count} video`, `- ${target[0].toUpperCase()}${target.slice(1)}`);
 }
 
 const ls = stats.long_scenes;
 lines.push('', ls ? `**Cảnh dài ≥ ${ls.threshold_s}s: ${ls.long_count}/${ls.scene_count}**` : '**Cảnh dài:** không có dữ liệu');
 if (ls?.long_count) {
-  lines.push(ls.scenes.map((n) => `${n} (${sec(ls.durations?.[String(n)] ?? 0)})`).join(', '));
-  lines.push(`Tổng ${sec(ls.long_seconds)} / ${sec(ls.total_seconds)} video gốc`);
+  for (const n of ls.scenes) lines.push(`- Cảnh ${n}: ${sec(ls.durations?.[String(n)] ?? 0)}`);
+  lines.push(`- Tổng: ${sec(ls.long_seconds)} / ${sec(ls.total_seconds)} video gốc`);
 }
 
-const ov = stats.overlaps;
-const maxRatio = ov ? Math.max(0, ...ov.per_video.map((v) => v.shared_ratio)) : null;
-if (!ov) {
+// Cảnh quay liền quá dài đã được chia (số "Cảnh dài" ở trên tính SAU khi chia).
+const shots = stats.scene_detection?.long_shots_split ?? [];
+if (shots.length) {
+  lines.push('', `**Cảnh dài đã chia nhỏ: ${shots.length}** (dài hơn ${stats.scene_detection.max_scene_s}s)`);
+  for (const x of shots) {
+    const into = x.scenes?.length ? `cảnh ${x.scenes.join(', ')}` : `${x.parts} phần`;
+    const cut = x.trimmed > 0 ? ` (bỏ ${sec(x.trimmed)})` : '';
+    lines.push(`- ${sec(x.end - x.start)} → ${into}${cut}`);
+  }
+}
+
+const videos = plan?.videos ?? [];
+let maxSource = null;
+let maxShared = null;
+if (!videos.length) {
   lines.push('', '**Đoạn trùng:** không có dữ liệu');
 } else {
-  lines.push('', '**Trùng theo video**');
-  for (const v of ov.per_video) {
-    lines.push(`Video ${v.video_index}: ${sec(v.shared_seconds)} / ${sec(v.total_duration)} · ${pct(v.shared_ratio)}`);
+  lines.push('', '**Đoạn trùng dài nhất với video gốc**');
+  for (const v of videos) {
+    const s = longestSource(v.scenes);
+    maxSource = Math.max(maxSource ?? 0, s);
+    lines.push(`- Video ${v.video_index}: ${sec(s)}`);
   }
-  lines.push('', `**Đoạn cảnh liên tiếp bị trùng: ${ov.runs.length}**`);
-  for (const r of ov.runs) {
-    lines.push(`Video ${r.videos.join(', ')} · cảnh ${sceneList(r.scenes)} (${r.scenes.length} cảnh) · ${sec(r.seconds)}`);
-  }
-}
-
-// So các video output với video gốc: đoạn giống hệt gốc = các cảnh số liền nhau đặt cạnh nhau.
-const so = stats.source_overlaps;
-if (so) {
-  const limit = so.max_s > 0 ? ` (mục tiêu ${so.target_s}s, tối đa ${so.max_s}s)` : '';
-  lines.push('', `**Trùng với video gốc**${limit}`);
-  for (const v of so.per_video) {
-    lines.push(`Video ${v.video_index}: ${sec(v.shared_seconds)} / ${sec(v.total_duration)} · ${pct(v.shared_ratio)}`
-      + ` · dài nhất ${sec(v.longest_seconds)} (cảnh ${sceneList(v.longest_scenes)})`);
-  }
-  lines.push('', `**Đoạn giống hệt video gốc: ${so.runs.length}**`);
-  const mark = { above_target: ' · trên mục tiêu', too_long: ' · QUÁ DÀI' };
-  for (const r of so.runs) {
-    lines.push(`Video ${r.video} · cảnh ${sceneList(r.scenes)} (${r.scenes.length} cảnh) · ${sec(r.seconds)}${mark[r.level] ?? ''}`);
+  if (videos.length > 1) {
+    lines.push('', '**Đoạn trùng dài nhất giữa các video**');
+    for (const v of videos) {
+      lines.push(`- Video ${v.video_index}`);
+      for (const o of videos) {
+        if (o === v) continue;
+        const s = longestShared(v.scenes, o.scenes);
+        maxShared = Math.max(maxShared ?? 0, s);
+        lines.push(`  - Với video ${o.video_index}: ${sec(s)}`); // thụt 2 dấu cách: bullet cấp 2 của Discord
+      }
+    }
   }
 }
 
 let content = lines.join('\n');
 if (content.length > MAX_CONTENT) content = `${content.slice(0, MAX_CONTENT - 30)}\n… (bị cắt bớt)`;
 
-// Màu cho embed nếu dùng: xanh < 20% trùng, vàng < 50%, đỏ từ 50%.
-const color = maxRatio === null ? '#95a5a6' : maxRatio < 0.2 ? '#2ecc71' : maxRatio < 0.5 ? '#f1c40f' : '#e74c3c';
+// Màu cho embed nếu dùng: đỏ khi có đoạn vượt mức tối đa trong .env, còn lại xanh; xám khi không có dữ liệu.
+const over = (value, max) => value !== null && max > 0 && value > max + 1e-6;
+const color = maxSource === null ? '#95a5a6'
+  : over(maxSource, rules?.source_run_max_s) || over(maxShared, rules?.max_shared_run_s) ? '#e74c3c' : '#2ecc71';
 
 return {
   json: {
@@ -105,8 +127,8 @@ return {
     color,
     job_id: jobId,
     aweme_id: awemeId,
-    max_shared_ratio: maxRatio,
-    max_source_run_s: so ? Math.max(0, ...so.per_video.map((v) => v.longest_seconds)) : null,
+    max_source_run_s: maxSource,
+    max_shared_run_s: maxShared,
     stats_json: statsJson,
   },
 };
